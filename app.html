@@ -725,26 +725,42 @@ function SetupPanel({ config, setConfig }) {
           <div>
             <Label>Schedule Mode</Label>
             <div style={{ display: "flex", gap: 0, border: `1px solid ${COLORS.border}`, borderRadius: 6, overflow: "hidden" }}>
-              {["random", "template"].map(mode => (
-                <button
-                  key={mode}
-                  onClick={() => setConfig({ ...config, scheduleMode: mode })}
-                  style={{
-                    flex: 1,
-                    padding: "8px 12px",
-                    fontSize: 13,
-                    fontWeight: 600,
-                    fontFamily: sansFont,
-                    background: (config.scheduleMode || "random") === mode ? COLORS.accent : COLORS.surface,
-                    color: (config.scheduleMode || "random") === mode ? "#fff" : COLORS.textMuted,
-                    border: "none",
-                    cursor: "pointer",
-                    transition: "all 0.15s",
-                  }}
-                >
-                  {mode === "random" ? "Random" : "Template"}
-                </button>
-              ))}
+              <button
+                onClick={() => setConfig({ ...config, scheduleMode: "random" })}
+                style={{
+                  flex: 1,
+                  padding: "8px 12px",
+                  fontSize: 13,
+                  fontWeight: 600,
+                  fontFamily: sansFont,
+                  background: (config.scheduleMode || "random") === "random" ? COLORS.accent : COLORS.surface,
+                  color: (config.scheduleMode || "random") === "random" ? "#fff" : COLORS.textMuted,
+                  border: "none",
+                  cursor: "pointer",
+                  transition: "all 0.15s",
+                }}
+              >
+                Random
+              </button>
+              <button
+                onClick={() => setShowProModal(true)}
+                style={{
+                  flex: 1,
+                  padding: "8px 12px",
+                  fontSize: 13,
+                  fontWeight: 600,
+                  fontFamily: sansFont,
+                  background: COLORS.surface,
+                  color: COLORS.textMuted,
+                  border: "none",
+                  cursor: "pointer",
+                  transition: "all 0.15s",
+                  position: "relative",
+                }}
+              >
+                Template
+                <span style={{ fontSize: 9, fontWeight: 700, background: COLORS.warn, color: "#fff", padding: "2px 5px", borderRadius: 3, marginLeft: 6, verticalAlign: "middle" }}>PRO</span>
+              </button>
             </div>
           </div>
         </div>
@@ -752,11 +768,6 @@ function SetupPanel({ config, setConfig }) {
           <div style={{ marginTop: 12, maxWidth: 200 }}>
             <Label>Daily Patient Volume</Label>
             <Input type="number" value={config.dailyVolume} onChange={v => setConfig({ ...config, dailyVolume: v })} />
-          </div>
-        )}
-        {(config.scheduleMode || "random") === "template" && (
-          <div style={{ marginTop: 8, fontSize: 13, color: COLORS.textMuted, fontFamily: sansFont }}>
-            Define your appointment schedule below in the Template Schedule section. Patient volume is determined by the template.
           </div>
         )}
       </Card>
@@ -879,108 +890,6 @@ function SetupPanel({ config, setConfig }) {
         ))}
       </Card>
 
-      {/* Template Schedule - only shown in template mode */}
-      {(config.scheduleMode || "random") === "template" && (
-        <Card>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
-            <div>
-              <span style={{ fontSize: 18, fontFamily: font, fontWeight: 700, color: COLORS.text }}>Template Schedule</span>
-              <div style={{ fontSize: 13, color: COLORS.textMuted, fontFamily: sansFont, marginTop: 2 }}>
-                {(config.templateSlots || []).length} appointments scheduled
-              </div>
-            </div>
-            <div style={{ display: "flex", gap: 8 }}>
-              <Button variant="secondary" onClick={() => {
-                const slots = config.templateSlots || [];
-                const lastSlot = slots[slots.length - 1];
-                const newTime = lastSlot ? addMinutesStr(lastSlot.arrival, 30) : config.operatingHours.start;
-                const newSlot = {
-                  arrival: newTime,
-                  apptType: config.appointmentTypes[0]?.name || "",
-                  assignTo: "any",
-                  assignIdx: 0,
-                };
-                setConfig({ ...config, templateSlots: [...slots, newSlot] });
-              }}>+ Add Appointment</Button>
-              <Button variant="secondary" onClick={() => {
-                const slots = [];
-                // Find the constraining role: the step with the longest duration in each appointment type
-                const constrainingRoles = new Set();
-                config.appointmentTypes.forEach(a => {
-                  if (a.flow.length === 0) return;
-                  const longest = a.flow.reduce((max, step) => step.duration > max.duration ? step : max, a.flow[0]);
-                  constrainingRoles.add(longest.staffRole);
-                });
-                config.staff.forEach(staffRole => {
-                  if (!constrainingRoles.has(staffRole.role)) return;
-                  for (let p = 0; p < staffRole.count; p++) {
-                    const sStart = parseTime(staffRole.shiftStart);
-                    const sEnd = parseTime(staffRole.shiftEnd);
-                    const lunch = (staffRole.lunches || [])[p];
-                    const lunchStart = lunch ? parseTime(lunch.start) : null;
-                    const lunchEnd = lunch ? lunchStart + (lunch.duration || 30) : null;
-                    let t = sStart;
-                    const apptType = config.appointmentTypes[0];
-                    const provStep = apptType?.flow.find(f => f.staffRole === staffRole.role);
-                    const interval = provStep ? provStep.duration : 20;
-                    while (t + interval <= sEnd) {
-                      if (lunchStart !== null && t >= lunchStart && t < lunchEnd) { t = lunchEnd; continue; }
-                      if (lunchStart !== null && t < lunchStart && t + interval > lunchStart) { t = lunchEnd; continue; }
-                      slots.push({
-                        arrival: formatTimeFromMin(t),
-                        apptType: apptType?.name || "",
-                        assignTo: staffRole.role,
-                        assignIdx: p,
-                      });
-                      t += interval;
-                    }
-                  }
-                });
-                slots.sort((a, b) => parseTime(a.arrival) - parseTime(b.arrival));
-                setConfig({ ...config, templateSlots: slots });
-              }}>Auto-fill from Staff</Button>
-            </div>
-          </div>
-
-          <div style={{ display: "grid", gridTemplateColumns: "0.8fr 1.5fr 1.5fr 0.8fr auto", gap: 8, marginBottom: 6 }}>
-            <div style={{ fontSize: 11, fontWeight: 600, color: COLORS.textMuted, fontFamily: sansFont, textTransform: "uppercase", letterSpacing: "0.04em" }}>Time</div>
-            <div style={{ fontSize: 11, fontWeight: 600, color: COLORS.textMuted, fontFamily: sansFont, textTransform: "uppercase", letterSpacing: "0.04em" }}>Appt Type</div>
-            <div style={{ fontSize: 11, fontWeight: 600, color: COLORS.textMuted, fontFamily: sansFont, textTransform: "uppercase", letterSpacing: "0.04em" }}>Assigned To</div>
-            <div style={{ fontSize: 11, fontWeight: 600, color: COLORS.textMuted, fontFamily: sansFont, textTransform: "uppercase", letterSpacing: "0.04em" }}>Staff #</div>
-            <div style={{ width: 34 }} />
-          </div>
-
-          <div style={{ maxHeight: 500, overflowY: "auto" }}>
-            {(config.templateSlots || []).map((slot, idx) => (
-              <div key={idx} style={{ display: "grid", gridTemplateColumns: "0.8fr 1.5fr 1.5fr 0.8fr auto", gap: 8, alignItems: "center", marginBottom: 4 }}>
-                <Input value={slot.arrival} onChange={v => { const next = [...(config.templateSlots || [])]; next[idx] = { ...next[idx], arrival: v }; setConfig({ ...config, templateSlots: next }); }} placeholder="8:00" />
-                <select value={slot.apptType} onChange={e => { const next = [...(config.templateSlots || [])]; next[idx] = { ...next[idx], apptType: e.target.value }; setConfig({ ...config, templateSlots: next }); }} style={{ width: "100%", padding: "8px 12px", border: `1px solid ${COLORS.border}`, borderRadius: 6, fontSize: 14, fontFamily: sansFont, background: COLORS.surface }}>
-                  {config.appointmentTypes.map(a => <option key={a.name} value={a.name}>{a.name}</option>)}
-                </select>
-                <select value={slot.assignTo} onChange={e => { const next = [...(config.templateSlots || [])]; next[idx] = { ...next[idx], assignTo: e.target.value, assignIdx: 0 }; setConfig({ ...config, templateSlots: next }); }} style={{ width: "100%", padding: "8px 12px", border: `1px solid ${COLORS.border}`, borderRadius: 6, fontSize: 14, fontFamily: sansFont, background: COLORS.surface }}>
-                  <option value="any">Any available</option>
-                  {config.staff.map(s => <option key={s.role} value={s.role}>{s.role}</option>)}
-                </select>
-                {slot.assignTo !== "any" ? (
-                  <select value={slot.assignIdx || 0} onChange={e => { const next = [...(config.templateSlots || [])]; next[idx] = { ...next[idx], assignIdx: Number(e.target.value) }; setConfig({ ...config, templateSlots: next }); }} style={{ width: "100%", padding: "8px 12px", border: `1px solid ${COLORS.border}`, borderRadius: 6, fontSize: 14, fontFamily: sansFont, background: COLORS.surface }}>
-                    {Array.from({ length: config.staff.find(s => s.role === slot.assignTo)?.count || 1 }, (_, k) => (
-                      <option key={k} value={k}>#{k + 1}</option>
-                    ))}
-                  </select>
-                ) : (
-                  <div style={{ padding: "8px 12px", fontSize: 13, color: COLORS.textLight, fontFamily: sansFont }}>—</div>
-                )}
-                <Button variant="ghost" onClick={() => { setConfig({ ...config, templateSlots: (config.templateSlots || []).filter((_, j) => j !== idx) }); }} style={{ color: COLORS.danger, fontSize: 18, padding: "8px" }}>×</Button>
-              </div>
-            ))}
-          </div>
-          {(config.templateSlots || []).length === 0 && (
-            <div style={{ textAlign: "center", padding: 30, color: COLORS.textMuted, fontFamily: sansFont, fontSize: 14 }}>
-              No appointments yet. Use "+ Add Appointment" to build one at a time, or "Auto-fill from Staff" to generate a full day.
-            </div>
-          )}
-        </Card>
-      )}
     </div>
   );
 }
@@ -1446,6 +1355,7 @@ function ClinicTempo() {
   const [compareA, setCompareA] = useState(null);
   const [compareB, setCompareB] = useState(null);
   const [saveName, setSaveName] = useState("");
+  const [showProModal, setShowProModal] = useState(false);
 
   const handlePreset = (key) => {
     setPresetKey(key);
@@ -1483,6 +1393,74 @@ function ClinicTempo() {
   return (
     <div style={{ minHeight: "100vh", background: COLORS.bg, fontFamily: sansFont, color: COLORS.text }}>
       <link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:wght@400;600;700&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+
+      {/* Pro Upgrade Modal */}
+      {showProModal && (
+        <div style={{
+          position: "fixed",
+          top: 0, left: 0, right: 0, bottom: 0,
+          background: "rgba(0,0,0,0.5)",
+          zIndex: 1000,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: 20,
+        }} onClick={() => setShowProModal(false)}>
+          <div style={{
+            background: COLORS.surface,
+            borderRadius: 12,
+            padding: "40px 36px",
+            maxWidth: 480,
+            width: "100%",
+            boxShadow: "0 20px 60px rgba(0,0,0,0.15)",
+            position: "relative",
+          }} onClick={e => e.stopPropagation()}>
+            <button onClick={() => setShowProModal(false)} style={{
+              position: "absolute", top: 12, right: 16,
+              background: "none", border: "none", fontSize: 22,
+              color: COLORS.textMuted, cursor: "pointer",
+            }}>×</button>
+            <div style={{ fontSize: 32, marginBottom: 12, textAlign: "center" }}>📋</div>
+            <div style={{ fontSize: 22, fontFamily: font, fontWeight: 700, color: COLORS.text, textAlign: "center", marginBottom: 8 }}>
+              Template Scheduling is a Pro Feature
+            </div>
+            <div style={{ fontSize: 15, color: COLORS.textMuted, fontFamily: sansFont, textAlign: "center", lineHeight: 1.6, marginBottom: 24 }}>
+              Plug in your actual appointment template with specific times and provider assignments. See how your real schedule performs, not just a random simulation.
+            </div>
+            <div style={{ background: COLORS.surfaceAlt, borderRadius: 8, padding: 20, marginBottom: 24 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: COLORS.text, fontFamily: sansFont, marginBottom: 10 }}>Pro includes:</div>
+              {["Template scheduling with provider assignment", "Scenario save & compare", "Auto-fill schedule from staff shifts", "Early adopter pricing: 30% off"].map(f => (
+                <div key={f} style={{ fontSize: 13, fontFamily: sansFont, color: COLORS.text, padding: "4px 0", display: "flex", gap: 8, alignItems: "center" }}>
+                  <span style={{ color: COLORS.good, fontWeight: 700 }}>✓</span> {f}
+                </div>
+              ))}
+            </div>
+            <a
+              href="https://clinictempo.com/#waitlist"
+              style={{
+                display: "block",
+                width: "100%",
+                padding: "14px 0",
+                background: COLORS.accent,
+                color: "#fff",
+                fontSize: 15,
+                fontWeight: 700,
+                fontFamily: sansFont,
+                border: "none",
+                borderRadius: 8,
+                textAlign: "center",
+                textDecoration: "none",
+                cursor: "pointer",
+              }}
+            >
+              Join the Pro Waitlist
+            </a>
+            <div style={{ fontSize: 12, color: COLORS.textMuted, fontFamily: sansFont, textAlign: "center", marginTop: 12 }}>
+              Free users get random mode, bottleneck analysis, and flow maps.
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Header */}
       <div style={{ background: COLORS.accent, padding: "24px 32px", color: "#fff" }}>
