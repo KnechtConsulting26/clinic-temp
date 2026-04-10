@@ -574,6 +574,7 @@
       <a href="#features">Features</a>
       <a href="#how-it-works">How It Works</a>
       <a href="#pricing">Pricing</a>
+      <a href="/app.html">Try Free</a>
       <a href="#waitlist" class="nav-cta">Join Waitlist</a>
     </div>
   </div>
@@ -586,8 +587,8 @@
     <h1 class="fade-up-d1">See your schedule's <span>bottlenecks</span> before patients do.</h1>
     <p class="fade-up-d2">Clinic Tempo lets you model your clinic's patient flow, test staffing changes, and compare schedule scenarios — all before anything changes on the floor.</p>
     <div class="hero-buttons fade-up-d3">
-      <a href="#waitlist" class="btn-primary">Join the Pro Waitlist</a>
-      <a href="#how-it-works" class="btn-secondary">See How It Works</a>
+      <a href="/app.html" class="btn-primary">Try Free</a>
+      <a href="#waitlist" class="btn-secondary">Join the Pro Waitlist</a>
     </div>
   </div>
   <div class="hero-visual fade-up-d4">
@@ -740,7 +741,7 @@
           <li>Hourly wait time charts</li>
           <li>Basic results dashboard</li>
         </ul>
-        <a href="#" class="btn-secondary">Try Free — Coming Soon</a>
+        <a href="/app.html" class="btn-secondary">Try Free</a>
       </div>
       <div class="pricing-card featured">
         <div class="pricing-tier">Pro</div>
@@ -777,10 +778,10 @@
 <!-- Footer -->
 <footer>
   <p>&copy; 2026 Clinic Tempo. Built for clinic managers who want better answers.</p>
-  <a href="mailto:hello@clinictempo.com">hello@clinictempo.com</a>
+  <a href="/cdn-cgi/l/email-protection#cca4a9a0a0a38cafa0a5a2a5afb8a9a1bca3e2afa3a1"><span class="__cf_email__" data-cfemail="d3bbb6bfbfbc93b0bfbabdbab0a7b6bea3bcfdb0bcbe">[email&#160;protected]</span></a>
 </footer>
 
-<script>
+<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script>
 function submitWaitlist() {
   const email = document.getElementById('waitlist-email').value;
   if (!email || !email.includes('@')) {
@@ -803,17 +804,4 @@ function submitWaitlist() {
       document.getElementById('waitlist-success').style.display = 'block';
     } else {
       alert('Something went wrong. Please try again.');
-      btn.textContent = 'Join Waitlist';
-      btn.disabled = false;
-    }
-  })
-  .catch(() => {
-    alert('Something went wrong. Please try again.');
-    btn.textContent = 'Join Waitlist';
-    btn.disabled = false;
-  });
-}
-</script>
-
-</body>
-</html>
+   
