@@ -662,7 +662,7 @@ function HorizBar({ label, value, max, color, unit = "min" }) {
 }
 
 // ─── Setup Panel ───
-function SetupPanel({ config, setConfig }) {
+function SetupPanel({ config, setConfig, setShowProModal }) {
   const updateStation = (idx, field, val) => {
     const next = [...config.stations];
     next[idx] = { ...next[idx], [field]: val };
@@ -1509,7 +1509,7 @@ function ClinicTempo() {
 
         {tab === "setup" && (
           <>
-            <SetupPanel config={config} setConfig={setConfig} />
+            <SetupPanel config={config} setConfig={setConfig} setShowProModal={setShowProModal} />
             <div style={{ display: "flex", gap: 12, marginTop: 24, justifyContent: "flex-end" }}>
               <Button onClick={handleRun} style={{ padding: "12px 32px", fontSize: 15 }}>
                 Run Simulation
