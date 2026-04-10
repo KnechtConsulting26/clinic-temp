@@ -142,6 +142,24 @@ function runSimulation(config, seed) {
     stationMetrics[s.name] = { totalWait: 0, totalService: 0, patientCount: 0, utilizedMinutes: 0 };
   });
 
+  const staffMetrics = {};
+  staff.forEach(s => {
+    staffMetrics[s.role] = staffMetrics[s.role] || { totalServiceMin: 0, individuals: [] };
+    const lunches = s.lunches || [];
+    for (let i = 0; i < s.count; i++) {
+      const sStart = parseTime(s.shiftStart);
+      const sEnd = parseTime(s.shiftEnd);
+      const lunch = lunches[i] || null;
+      const lunchMin = lunch ? (lunch.duration || 30) : 0;
+      staffMetrics[s.role].individuals.push({
+        label: s.count > 1 ? `${s.role} #${i + 1}` : s.role,
+        serviceMin: 0,
+        shiftMin: sEnd - sStart,
+        availableMin: sEnd - sStart - lunchMin,
+      });
+    }
+  });
+
   // Event-driven: repeatedly find the patient who can start their next step soonest
   const MAX_ITERATIONS = Math.max(patients.length, dailyVolume || 0) * 20; // safety valve
   let iterations = 0;
@@ -284,6 +302,11 @@ function runSimulation(config, seed) {
     stationMetrics[station].patientCount += 1;
     stationMetrics[station].utilizedMinutes += duration;
 
+    if (role && staffMetrics[role] && bestStaffIdx >= 0 && bestStaffIdx < staffMetrics[role].individuals.length) {
+      staffMetrics[role].individuals[bestStaffIdx].serviceMin += duration;
+      staffMetrics[role].totalServiceMin += duration;
+    }
+
     patient.log.push({
       station,
       staffRole: role,
@@ -349,6 +372,7 @@ function runSimulation(config, seed) {
     bottlenecks,
     hourlyData,
     stationMetrics,
+    staffMetrics,
   };
 }
 
@@ -1217,11 +1241,11 @@ function ResultsPanel({ result, config }) {
         ))}
       </Card>
 
-      {/* Station Utilization */}
+      {/* Room / Station Utilization */}
       <Card>
-        <div style={{ fontSize: 18, fontFamily: font, fontWeight: 700, color: COLORS.text, marginBottom: 4 }}>Station Utilization</div>
+        <div style={{ fontSize: 18, fontFamily: font, fontWeight: 700, color: COLORS.text, marginBottom: 4 }}>Room / Station Utilization</div>
         <div style={{ fontSize: 13, color: COLORS.textMuted, fontFamily: sansFont, marginBottom: 16 }}>
-          Percentage of available capacity used (over 85% signals a constraint)
+          Percentage of physical capacity used. Answers: "Do I need more rooms?"
         </div>
         {bottlenecks.map(b => {
           const pct = (b.utilization * 100);
@@ -1229,6 +1253,33 @@ function ResultsPanel({ result, config }) {
           return <HorizBar key={b.name} label={b.name} value={pct} max={100} color={color} unit="%" />;
         })}
       </Card>
+
+      {/* Staff Utilization */}
+      {result.staffMetrics && (
+        <Card>
+          <div style={{ fontSize: 18, fontFamily: font, fontWeight: 700, color: COLORS.text, marginBottom: 4 }}>Staff Utilization</div>
+          <div style={{ fontSize: 13, color: COLORS.textMuted, fontFamily: sansFont, marginBottom: 16 }}>
+            Percentage of available shift time spent with patients (excludes lunch). Answers: "Do I need more staff?"
+          </div>
+          {Object.entries(result.staffMetrics).map(([role, data]) => (
+            <div key={role} style={{ marginBottom: 16 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, fontFamily: sansFont, color: COLORS.text, marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.03em" }}>{role}</div>
+              {data.individuals.map((ind, idx) => {
+                const pct = ind.availableMin > 0 ? (ind.serviceMin / ind.availableMin) * 100 : 0;
+                const color = pct > 85 ? COLORS.danger : pct > 65 ? COLORS.warn : COLORS.good;
+                return (
+                  <div key={idx} style={{ marginBottom: 8 }}>
+                    <HorizBar label={ind.label} value={pct} max={100} color={color} unit="%" />
+                    <div style={{ fontSize: 11, color: COLORS.textMuted, fontFamily: sansFont, marginTop: -8, marginBottom: 4 }}>
+                      {ind.serviceMin.toFixed(0)}m service / {ind.availableMin}m available
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+        </Card>
+      )}
 
       {/* Hourly Pattern */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
@@ -1250,21 +1301,85 @@ function ResultsPanel({ result, config }) {
         <div style={{ fontSize: 15, fontFamily: font, fontWeight: 700, color: COLORS.text, marginBottom: 8 }}>Key Findings</div>
         <div style={{ fontSize: 14, fontFamily: sansFont, color: COLORS.text, lineHeight: 1.7 }}>
           {maxWaitStation && maxWaitStation.avgWait > 5 && (
-            <p style={{ margin: "0 0 8px" }}>
+            <p style={{ margin: "0 0 12px" }}>
               <strong style={{ color: COLORS.danger }}>{maxWaitStation.name}</strong> is your primary bottleneck with an average wait of {maxWaitStation.avgWait.toFixed(1)} minutes per patient.
-              {maxWaitStation.utilization > 0.85
-                ? " This station is running above 85% utilization, meaning capacity is the constraint. Consider adding a room or extending hours."
-                : " Utilization is moderate, so the constraint may be staffing rather than physical capacity. Check staff availability during peak hours."}
             </p>
           )}
+
+          {result.staffMetrics && (() => {
+            const allStaff = [];
+            Object.entries(result.staffMetrics).forEach(([role, data]) => {
+              data.individuals.forEach(ind => {
+                const pct = ind.availableMin > 0 ? (ind.serviceMin / ind.availableMin) * 100 : 0;
+                allStaff.push({ ...ind, role, pct });
+              });
+            });
+            const overloaded = allStaff.filter(s => s.pct > 85);
+            const underused = allStaff.filter(s => s.pct < 40);
+            const highestUtil = allStaff.length > 0 ? allStaff.reduce((a, b) => b.pct > a.pct ? b : a) : null;
+
+            return (
+              <>
+                {overloaded.length > 0 && (
+                  <p style={{ margin: "0 0 12px" }}>
+                    <strong style={{ color: COLORS.danger }}>Staff at capacity:</strong> {overloaded.map(s => `${s.label} (${s.pct.toFixed(0)}%)`).join(", ")} {overloaded.length === 1 ? "is" : "are"} running above 85% utilization. This leaves little room for late patients, documentation, or unexpected delays. Consider adding staff in this role or reducing patient volume.
+                  </p>
+                )}
+                {overloaded.length === 0 && highestUtil && highestUtil.pct > 65 && (
+                  <p style={{ margin: "0 0 12px" }}>
+                    <strong style={{ color: COLORS.warn }}>Busiest staff member:</strong> {highestUtil.label} at {highestUtil.pct.toFixed(0)}% utilization. Not at capacity yet, but approaching the point where adding patients would create noticeable wait times.
+                  </p>
+                )}
+                {underused.length > 0 && overloaded.length > 0 && (
+                  <p style={{ margin: "0 0 12px" }}>
+                    <strong style={{ color: COLORS.good }}>Underutilized staff:</strong> {underused.map(s => `${s.label} (${s.pct.toFixed(0)}%)`).join(", ")} {underused.length === 1 ? "has" : "have"} significant available capacity. If cross-training is possible, these staff could absorb some of the load from overloaded roles.
+                  </p>
+                )}
+              </>
+            );
+          })()}
+
+          {(() => {
+            const bottleneckStation = maxWaitStation;
+            if (bottleneckStation && bottleneckStation.utilization < 0.50 && bottleneckStation.avgWait > 5) {
+              return (
+                <p style={{ margin: "0 0 12px" }}>
+                  <strong>{bottleneckStation.name}</strong> rooms are only {(bottleneckStation.utilization * 100).toFixed(0)}% utilized despite being your biggest bottleneck. The constraint is staffing, not physical space. Adding more rooms would not reduce wait times. Adding staff to this station would.
+                </p>
+              );
+            } else if (bottleneckStation && bottleneckStation.utilization > 0.85) {
+              return (
+                <p style={{ margin: "0 0 12px" }}>
+                  <strong style={{ color: COLORS.danger }}>Room capacity constraint:</strong> {bottleneckStation.name} is above 85% room utilization. Physical space is limiting throughput. Consider adding rooms or extending operating hours.
+                </p>
+              );
+            }
+            return null;
+          })()}
+
           {hourlyData.length > 0 && (() => {
             const peakHour = hourlyData.reduce((a, b) => b.avgWait > a.avgWait ? b : a);
             return peakHour.avgWait > 10 ? (
-              <p style={{ margin: "0 0 8px" }}>Peak wait times occur around <strong>{peakHour.hour}</strong>. Staggering appointments or adding staff during this window could reduce delays.</p>
+              <p style={{ margin: "0 0 12px" }}>
+                <strong>Peak wait times occur around {peakHour.hour}.</strong> Staggering appointments or adding staff during this window could reduce delays.
+              </p>
             ) : null;
           })()}
+
           {summary.avgWait < 10 && (
-            <p style={{ margin: 0, color: COLORS.good }}>Overall flow looks healthy. Average wait under 10 minutes suggests good capacity-demand balance.</p>
+            <p style={{ margin: "0 0 0", color: COLORS.good }}>
+              <strong>Overall flow looks healthy.</strong> Average wait under 10 minutes suggests good capacity-demand balance.
+            </p>
+          )}
+          {summary.avgWait >= 10 && summary.avgWait < 20 && (
+            <p style={{ margin: "0 0 0", color: COLORS.warn }}>
+              <strong>Flow is functional but showing strain.</strong> Average wait of {summary.avgWait.toFixed(0)} minutes is noticeable to patients. Small adjustments to staffing or scheduling could bring meaningful improvement.
+            </p>
+          )}
+          {summary.avgWait >= 20 && (
+            <p style={{ margin: "0 0 0", color: COLORS.danger }}>
+              <strong>Significant flow issues.</strong> Average wait of {summary.avgWait.toFixed(0)} minutes indicates a systemic capacity problem. Review the bottleneck station and staff utilization above for specific constraints to address.
+            </p>
           )}
         </div>
       </Card>
