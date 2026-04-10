@@ -113,6 +113,10 @@ function runSimulation(config, seed) {
     }
   }
 
+  // Sort by arrival time and renumber chronologically
+  patients.sort((a, b) => a.arrival - b.arrival);
+  patients.forEach((p, i) => { p.id = i + 1; });
+
   // Resource pools: each slot tracks when it becomes free
   const stationPool = {};
   stations.forEach(s => {
@@ -1429,11 +1433,21 @@ function ClinicTempo() {
             </div>
             <div style={{ background: COLORS.surfaceAlt, borderRadius: 8, padding: 20, marginBottom: 24 }}>
               <div style={{ fontSize: 13, fontWeight: 600, color: COLORS.text, fontFamily: sansFont, marginBottom: 10 }}>Pro includes:</div>
-              {["Template scheduling with provider assignment", "Scenario save & compare", "Auto-fill schedule from staff shifts", "Early adopter pricing: 30% off"].map(f => (
+              {["Template scheduling with provider assignment", "Scenario save & compare", "Auto-fill schedule from staff shifts", "PDF and PowerPoint export"].map(f => (
                 <div key={f} style={{ fontSize: 13, fontFamily: sansFont, color: COLORS.text, padding: "4px 0", display: "flex", gap: 8, alignItems: "center" }}>
                   <span style={{ color: COLORS.good, fontWeight: 700 }}>✓</span> {f}
                 </div>
               ))}
+              <div style={{ borderTop: `1px solid ${COLORS.border}`, marginTop: 12, paddingTop: 12, display: "flex", gap: 16 }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: COLORS.textMuted, fontFamily: sansFont }}>MONTHLY</div>
+                  <div style={{ fontSize: 20, fontWeight: 700, fontFamily: font }}>$39<span style={{ fontSize: 13, fontWeight: 400, color: COLORS.textMuted }}>/mo</span></div>
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: COLORS.good, fontFamily: sansFont }}>ANNUAL — SAVE 25%</div>
+                  <div style={{ fontSize: 20, fontWeight: 700, fontFamily: font }}>$349<span style={{ fontSize: 13, fontWeight: 400, color: COLORS.textMuted }}>/yr</span></div>
+                </div>
+              </div>
             </div>
             <a
               href="https://clinictempo.com/#waitlist"
