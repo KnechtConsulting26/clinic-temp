@@ -1,0 +1,1621 @@
+import { useState, useCallback, useMemo, useRef, useEffect } from "react";
+
+// ─── Seeded PRNG (Mulberry32) ───
+function createRng(seed) {
+  let s = seed | 0;
+  return function() {
+    s = (s + 0x6D2B79F5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ─── Simulation Engine (Event-Driven) ───
+function runSimulation(config, seed) {
+  const rng = createRng(seed || 12345);
+  const { stations, staff, appointmentTypes, dailyVolume, operatingHours } = config;
+  const startMin = parseTime(operatingHours.start);
+  const endMin = parseTime(operatingHours.end);
+  const totalMinutes = endMin - startMin;
+
+  if (totalMinutes <= 0 || appointmentTypes.length === 0) {
+    return {
+      patients: [],
+      summary: { avgWait: 0, avgThroughput: 0, maxWait: 0, totalPatients: 0 },
+      bottlenecks: [],
+      hourlyData: [],
+      stationMetrics: {},
+    };
+  }
+
+  const isTemplate = (config.scheduleMode || "random") === "template";
+  const templateSlots = config.templateSlots || [];
+
+  if (!isTemplate && dailyVolume <= 0) {
+    return {
+      patients: [],
+      summary: { avgWait: 0, avgThroughput: 0, maxWait: 0, totalPatients: 0 },
+      bottlenecks: [],
+      hourlyData: [],
+      stationMetrics: {},
+    };
+  }
+
+  // Build patients
+  const patients = [];
+
+  if (isTemplate && templateSlots.length > 0) {
+    // Template mode: use defined appointment slots
+    templateSlots.forEach((slot, i) => {
+      const apptType = appointmentTypes.find(a => a.name === slot.apptType) || appointmentTypes[0];
+      const arrivalMin = parseTime(slot.arrival);
+      patients.push({
+        id: i + 1,
+        type: apptType.name,
+        arrival: arrivalMin,
+        flow: apptType.flow.map(f => ({
+          ...f,
+          duration: Math.max(1, f.duration + Math.floor((rng() - 0.5) * f.duration * 0.3)),
+        })),
+        currentStep: 0,
+        readyAt: arrivalMin,
+        log: [],
+        totalWait: 0,
+        totalService: 0,
+        done: false,
+        // Provider pinning
+        pinnedRole: slot.assignTo !== "any" ? slot.assignTo : null,
+        pinnedIdx: slot.assignTo !== "any" ? (slot.assignIdx || 0) : null,
+      });
+    });
+  } else {
+    // Random mode: generate patients randomly
+    for (let i = 0; i < dailyVolume; i++) {
+      const apptType = appointmentTypes[Math.floor(rng() * appointmentTypes.length)];
+      const arrivalMin = startMin + Math.floor(rng() * Math.max(totalMinutes - 30, 1));
+      patients.push({
+        id: i + 1,
+        type: apptType.name,
+        arrival: arrivalMin,
+        flow: apptType.flow.map(f => ({
+          ...f,
+          duration: Math.max(1, f.duration + Math.floor((rng() - 0.5) * f.duration * 0.3)),
+        })),
+        currentStep: 0,
+        readyAt: arrivalMin,
+        log: [],
+        totalWait: 0,
+        totalService: 0,
+        done: false,
+        pinnedRole: null,
+        pinnedIdx: null,
+      });
+    }
+  }
+
+  // Resource pools: each slot tracks when it becomes free
+  const stationPool = {};
+  stations.forEach(s => {
+    stationPool[s.name] = Array.from({ length: Math.max(s.capacity, 1) }, () => startMin);
+  });
+
+  const staffPool = {};
+  staff.forEach(s => {
+    const sStart = parseTime(s.shiftStart);
+    const sEnd = parseTime(s.shiftEnd);
+    staffPool[s.role] = staffPool[s.role] || [];
+    const lunches = s.lunches || [];
+    for (let i = 0; i < s.count; i++) {
+      const lunch = lunches[i] || null;
+      const lunchStart = lunch ? parseTime(lunch.start) : null;
+      const lunchEnd = lunch ? lunchStart + (lunch.duration || 30) : null;
+      staffPool[s.role].push({ freeAt: sStart, shiftStart: sStart, shiftEnd: sEnd, lunchStart, lunchEnd });
+    }
+  });
+
+  const stationMetrics = {};
+  stations.forEach(s => {
+    stationMetrics[s.name] = { totalWait: 0, totalService: 0, patientCount: 0, utilizedMinutes: 0 };
+  });
+
+  // Event-driven: repeatedly find the patient who can start their next step soonest
+  const MAX_ITERATIONS = Math.max(patients.length, dailyVolume || 0) * 20; // safety valve
+  let iterations = 0;
+
+  while (iterations < MAX_ITERATIONS) {
+    iterations++;
+
+    // Find all patients who still have steps remaining
+    let bestPatient = null;
+    let bestCanStart = Infinity;
+    let bestStationIdx = 0;
+    let bestStaffIdx = -1;
+
+    for (const patient of patients) {
+      if (patient.done) continue;
+      if (patient.currentStep >= patient.flow.length) {
+        patient.done = true;
+        continue;
+      }
+
+      const step = patient.flow[patient.currentStep];
+      const station = step.station;
+      const role = step.staffRole;
+
+      // Earliest this patient is ready
+      const patientReady = patient.readyAt;
+
+      // Find earliest station slot
+      let stIdx = 0;
+      let stationFree = patientReady;
+      if (stationPool[station]) {
+        let minFree = stationPool[station][0];
+        stIdx = 0;
+        for (let j = 1; j < stationPool[station].length; j++) {
+          if (stationPool[station][j] < minFree) {
+            minFree = stationPool[station][j];
+            stIdx = j;
+          }
+        }
+        stationFree = Math.max(patientReady, minFree);
+      }
+
+      // Find earliest staff (accounting for lunch breaks)
+      let sfIdx = -1;
+      let staffFree = patientReady;
+      if (role && staffPool[role] && staffPool[role].length > 0) {
+        let bestAvail = null;
+        // Helper: get effective available time considering lunch
+        const getEffectiveAvail = (s, taskDuration) => {
+          let avail = Math.max(patientReady, s.freeAt);
+          if (s.lunchStart !== null && s.lunchEnd !== null) {
+            // If available time falls during lunch, push to after lunch
+            if (avail >= s.lunchStart && avail < s.lunchEnd) {
+              avail = s.lunchEnd;
+            }
+            // If task would start before lunch but bleed into it, push to after lunch
+            if (avail < s.lunchStart && avail + taskDuration > s.lunchStart) {
+              avail = s.lunchEnd;
+            }
+          }
+          return avail;
+        };
+
+        const taskDur = patient.flow[patient.currentStep]?.duration || 0;
+
+        // Check if this patient is pinned to a specific staff member for this role
+        const isPinned = patient.pinnedRole === role && patient.pinnedIdx !== null;
+
+        if (isPinned && patient.pinnedIdx < staffPool[role].length) {
+          // Pinned: only consider the assigned staff member
+          const s = staffPool[role][patient.pinnedIdx];
+          const effAvail = getEffectiveAvail(s, taskDur);
+          bestAvail = effAvail;
+          sfIdx = patient.pinnedIdx;
+        } else {
+          // Unpinned: find best available staff
+          // Prefer staff on shift
+          for (let j = 0; j < staffPool[role].length; j++) {
+            const s = staffPool[role][j];
+            const effAvail = getEffectiveAvail(s, taskDur);
+            if (effAvail < s.shiftEnd) {
+              if (bestAvail === null || effAvail < bestAvail) {
+                bestAvail = effAvail;
+                sfIdx = j;
+              }
+            }
+          }
+          // Fallback to any staff
+          if (sfIdx === -1) {
+            for (let j = 0; j < staffPool[role].length; j++) {
+              const effAvail = getEffectiveAvail(staffPool[role][j], taskDur);
+              if (bestAvail === null || effAvail < bestAvail) {
+                bestAvail = effAvail;
+                sfIdx = j;
+              }
+            }
+          }
+        }
+        if (sfIdx >= 0 && bestAvail !== null) {
+          staffFree = bestAvail;
+        }
+      }
+
+      const canStart = Math.max(stationFree, staffFree);
+
+      if (canStart < bestCanStart) {
+        bestCanStart = canStart;
+        bestPatient = patient;
+        bestStationIdx = stIdx;
+        bestStaffIdx = sfIdx;
+      }
+    }
+
+    // No more patients to process
+    if (!bestPatient) break;
+
+    const patient = bestPatient;
+    const step = patient.flow[patient.currentStep];
+    const station = step.station;
+    const role = step.staffRole;
+    const duration = step.duration;
+    const actualStart = bestCanStart;
+    const waitTime = actualStart - patient.readyAt;
+    const serviceEnd = actualStart + duration;
+
+    // Update resource availability
+    if (stationPool[station]) {
+      stationPool[station][bestStationIdx] = serviceEnd;
+    }
+    if (bestStaffIdx >= 0 && role && staffPool[role]) {
+      staffPool[role][bestStaffIdx].freeAt = serviceEnd;
+    }
+
+    // Record
+    if (!stationMetrics[station]) {
+      stationMetrics[station] = { totalWait: 0, totalService: 0, patientCount: 0, utilizedMinutes: 0 };
+    }
+    stationMetrics[station].totalWait += waitTime;
+    stationMetrics[station].totalService += duration;
+    stationMetrics[station].patientCount += 1;
+    stationMetrics[station].utilizedMinutes += duration;
+
+    patient.log.push({
+      station,
+      staffRole: role,
+      arrival: patient.readyAt,
+      serviceStart: actualStart,
+      serviceEnd,
+      wait: waitTime,
+      duration,
+    });
+    patient.totalWait += waitTime;
+    patient.totalService += duration;
+    patient.readyAt = serviceEnd;
+    patient.currentStep++;
+
+    if (patient.currentStep >= patient.flow.length) {
+      patient.done = true;
+    }
+  }
+
+  // Mark any remaining patients as done
+  patients.forEach(p => { p.done = true; });
+
+  // Compute summary
+  const completedPatients = patients.filter(p => p.log.length > 0);
+  const totalPatients = completedPatients.length || 1;
+  const avgWait = completedPatients.reduce((s, p) => s + p.totalWait, 0) / totalPatients;
+  const avgThroughput = completedPatients.reduce((s, p) => {
+    const lastStep = p.log[p.log.length - 1];
+    return s + (lastStep ? lastStep.serviceEnd - p.arrival : 0);
+  }, 0) / totalPatients;
+  const maxWait = completedPatients.length > 0
+    ? Math.max(...completedPatients.map(p => p.totalWait))
+    : 0;
+
+  const bottlenecks = Object.entries(stationMetrics)
+    .map(([name, m]) => ({
+      name,
+      avgWait: m.patientCount > 0 ? m.totalWait / m.patientCount : 0,
+      avgService: m.patientCount > 0 ? m.totalService / m.patientCount : 0,
+      patients: m.patientCount,
+      utilization: totalMinutes > 0 && stations.find(s => s.name === name)
+        ? Math.min(m.utilizedMinutes / (totalMinutes * (stations.find(s => s.name === name)?.capacity || 1)), 2)
+        : 0,
+    }))
+    .sort((a, b) => b.avgWait - a.avgWait);
+
+  // Hourly pattern
+  const hourlyData = [];
+  for (let h = Math.floor(startMin / 60); h < Math.ceil(endMin / 60); h++) {
+    const hStart = h * 60;
+    const hEnd = (h + 1) * 60;
+    const hPatients = completedPatients.filter(p => p.arrival >= hStart && p.arrival < hEnd);
+    hourlyData.push({
+      hour: `${h % 12 || 12}${h < 12 ? 'a' : 'p'}`,
+      arrivals: hPatients.length,
+      avgWait: hPatients.length > 0 ? hPatients.reduce((s, p) => s + p.totalWait, 0) / hPatients.length : 0,
+    });
+  }
+
+  return {
+    patients: completedPatients,
+    summary: { avgWait, avgThroughput, maxWait, totalPatients: completedPatients.length },
+    bottlenecks,
+    hourlyData,
+    stationMetrics,
+  };
+}
+
+function parseTime(str) {
+  const [h, m] = str.split(":").map(Number);
+  return h * 60 + (m || 0);
+}
+
+function formatMin(m) {
+  const h = Math.floor(m / 60);
+  const min = Math.round(m % 60);
+  return `${h}h ${min}m`;
+}
+
+function formatTimeFromMin(totalMin) {
+  const h = Math.floor(totalMin / 60);
+  const m = Math.round(totalMin % 60);
+  return `${h}:${m.toString().padStart(2, "0")}`;
+}
+
+function addMinutesStr(timeStr, mins) {
+  const total = parseTime(timeStr) + mins;
+  return formatTimeFromMin(total);
+}
+
+// ─── Default Configs ───
+const PRESETS = {
+  "Primary Care": {
+    stations: [
+      { name: "Check-in", capacity: 2 },
+      { name: "Vitals", capacity: 2 },
+      { name: "Exam Room", capacity: 4 },
+      { name: "Checkout", capacity: 1 },
+    ],
+    staff: [
+      { role: "Front Desk", count: 2, shiftStart: "8:00", shiftEnd: "17:00", lunches: [{ start: "11:30", duration: 30 }, { start: "12:00", duration: 30 }] },
+      { role: "MA", count: 2, shiftStart: "8:00", shiftEnd: "17:00", lunches: [{ start: "12:00", duration: 30 }, { start: "12:30", duration: 30 }] },
+      { role: "Provider", count: 2, shiftStart: "8:00", shiftEnd: "17:00", lunches: [{ start: "12:00", duration: 60 }, { start: "13:00", duration: 60 }] },
+    ],
+    appointmentTypes: [
+      {
+        name: "Established Visit",
+        flow: [
+          { station: "Check-in", staffRole: "Front Desk", duration: 5 },
+          { station: "Vitals", staffRole: "MA", duration: 8 },
+          { station: "Exam Room", staffRole: "Provider", duration: 20 },
+          { station: "Checkout", staffRole: "Front Desk", duration: 5 },
+        ],
+      },
+      {
+        name: "New Patient",
+        flow: [
+          { station: "Check-in", staffRole: "Front Desk", duration: 10 },
+          { station: "Vitals", staffRole: "MA", duration: 10 },
+          { station: "Exam Room", staffRole: "Provider", duration: 30 },
+          { station: "Checkout", staffRole: "Front Desk", duration: 8 },
+        ],
+      },
+    ],
+    dailyVolume: 32,
+    operatingHours: { start: "8:00", end: "17:00" },
+  },
+  "Specialty Outpatient": {
+    stations: [
+      { name: "Reception", capacity: 1 },
+      { name: "Pre-Assessment", capacity: 2 },
+      { name: "Treatment Bay", capacity: 6 },
+      { name: "Recovery", capacity: 3 },
+      { name: "Discharge", capacity: 1 },
+    ],
+    staff: [
+      { role: "Admin", count: 1, shiftStart: "7:00", shiftEnd: "16:00", lunches: [{ start: "11:30", duration: 30 }] },
+      { role: "RN", count: 3, shiftStart: "7:00", shiftEnd: "15:30", lunches: [{ start: "11:00", duration: 30 }, { start: "11:30", duration: 30 }, { start: "12:00", duration: 30 }] },
+      { role: "Specialist", count: 2, shiftStart: "8:00", shiftEnd: "16:00", lunches: [{ start: "12:00", duration: 60 }, { start: "13:00", duration: 60 }] },
+      { role: "Tech", count: 2, shiftStart: "7:00", shiftEnd: "15:30", lunches: [{ start: "11:30", duration: 30 }, { start: "12:00", duration: 30 }] },
+    ],
+    appointmentTypes: [
+      {
+        name: "Standard Treatment",
+        flow: [
+          { station: "Reception", staffRole: "Admin", duration: 5 },
+          { station: "Pre-Assessment", staffRole: "RN", duration: 15 },
+          { station: "Treatment Bay", staffRole: "Specialist", duration: 45 },
+          { station: "Recovery", staffRole: "RN", duration: 20 },
+          { station: "Discharge", staffRole: "Admin", duration: 5 },
+        ],
+      },
+    ],
+    dailyVolume: 18,
+    operatingHours: { start: "7:00", end: "16:00" },
+  },
+  "Urgent Care": {
+    stations: [
+      { name: "Triage", capacity: 2 },
+      { name: "Exam Room", capacity: 5 },
+      { name: "Procedures", capacity: 1 },
+      { name: "Discharge", capacity: 1 },
+    ],
+    staff: [
+      { role: "Triage RN", count: 2, shiftStart: "8:00", shiftEnd: "20:00", lunches: [{ start: "12:00", duration: 30 }, { start: "12:30", duration: 30 }] },
+      { role: "Provider", count: 2, shiftStart: "8:00", shiftEnd: "20:00", lunches: [{ start: "12:00", duration: 60 }, { start: "13:00", duration: 60 }] },
+      { role: "Tech", count: 1, shiftStart: "8:00", shiftEnd: "20:00", lunches: [{ start: "12:00", duration: 30 }] },
+      { role: "Front Desk", count: 1, shiftStart: "8:00", shiftEnd: "20:00", lunches: [{ start: "12:00", duration: 30 }] },
+    ],
+    appointmentTypes: [
+      {
+        name: "Low Acuity",
+        flow: [
+          { station: "Triage", staffRole: "Triage RN", duration: 5 },
+          { station: "Exam Room", staffRole: "Provider", duration: 15 },
+          { station: "Discharge", staffRole: "Front Desk", duration: 5 },
+        ],
+      },
+      {
+        name: "Moderate Acuity",
+        flow: [
+          { station: "Triage", staffRole: "Triage RN", duration: 8 },
+          { station: "Exam Room", staffRole: "Provider", duration: 25 },
+          { station: "Procedures", staffRole: "Tech", duration: 15 },
+          { station: "Discharge", staffRole: "Front Desk", duration: 5 },
+        ],
+      },
+    ],
+    dailyVolume: 45,
+    operatingHours: { start: "8:00", end: "20:00" },
+  },
+};
+
+// ─── Styles ───
+const COLORS = {
+  bg: "#F8F7F4",
+  surface: "#FFFFFF",
+  surfaceAlt: "#F1F0EC",
+  border: "#E2E0DA",
+  borderStrong: "#C9C6BC",
+  text: "#2C2A25",
+  textMuted: "#7A7770",
+  textLight: "#A8A49C",
+  accent: "#1B6B5A",
+  accentLight: "#E8F4F0",
+  accentDark: "#145247",
+  warn: "#C4652A",
+  warnLight: "#FDF0E8",
+  danger: "#B84040",
+  dangerLight: "#FCEAEA",
+  good: "#2A8C5A",
+  goodLight: "#E8F8EF",
+  chart1: "#1B6B5A",
+  chart2: "#C4652A",
+  chart3: "#5B6ABF",
+  chart4: "#8B5E3C",
+  chart5: "#7B2D8B",
+};
+
+const font = "'Source Serif 4', 'Georgia', serif";
+const sansFont = "'DM Sans', 'Segoe UI', sans-serif";
+
+// ─── Components ───
+function Card({ children, style, ...props }) {
+  return (
+    <div style={{
+      background: COLORS.surface,
+      border: `1px solid ${COLORS.border}`,
+      borderRadius: 10,
+      padding: 24,
+      ...style,
+    }} {...props}>
+      {children}
+    </div>
+  );
+}
+
+function Label({ children, style }) {
+  return <label style={{ fontSize: 12, fontWeight: 600, color: COLORS.textMuted, letterSpacing: "0.04em", textTransform: "uppercase", fontFamily: sansFont, display: "block", marginBottom: 6, ...style }}>{children}</label>;
+}
+
+function Input({ value, onChange, type = "text", style, ...props }) {
+  return (
+    <input
+      type={type}
+      value={value}
+      onChange={e => onChange(type === "number" ? (e.target.value === "" ? "" : Number(e.target.value)) : e.target.value)}
+      style={{
+        width: "100%",
+        padding: "8px 12px",
+        border: `1px solid ${COLORS.border}`,
+        borderRadius: 6,
+        fontSize: 14,
+        fontFamily: sansFont,
+        color: COLORS.text,
+        background: COLORS.surface,
+        boxSizing: "border-box",
+        outline: "none",
+        transition: "border-color 0.15s",
+        ...style,
+      }}
+      onFocus={e => e.target.style.borderColor = COLORS.accent}
+      onBlur={e => e.target.style.borderColor = COLORS.border}
+      {...props}
+    />
+  );
+}
+
+function Button({ children, onClick, variant = "primary", style, disabled }) {
+  const styles = {
+    primary: { background: COLORS.accent, color: "#fff", border: "none" },
+    secondary: { background: COLORS.surfaceAlt, color: COLORS.text, border: `1px solid ${COLORS.border}` },
+    danger: { background: COLORS.dangerLight, color: COLORS.danger, border: `1px solid ${COLORS.danger}33` },
+    ghost: { background: "transparent", color: COLORS.textMuted, border: "none" },
+  };
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        padding: "8px 18px",
+        borderRadius: 6,
+        fontSize: 13,
+        fontWeight: 600,
+        fontFamily: sansFont,
+        cursor: disabled ? "not-allowed" : "pointer",
+        opacity: disabled ? 0.5 : 1,
+        transition: "all 0.15s",
+        ...styles[variant],
+        ...style,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function Tabs({ tabs, active, onChange }) {
+  return (
+    <div style={{ display: "flex", gap: 0, borderBottom: `2px solid ${COLORS.border}`, marginBottom: 24 }}>
+      {tabs.map(t => (
+        <button
+          key={t.key}
+          onClick={() => onChange(t.key)}
+          style={{
+            padding: "12px 20px",
+            fontSize: 14,
+            fontWeight: active === t.key ? 700 : 500,
+            fontFamily: sansFont,
+            color: active === t.key ? COLORS.accent : COLORS.textMuted,
+            background: "none",
+            border: "none",
+            borderBottom: active === t.key ? `2px solid ${COLORS.accent}` : "2px solid transparent",
+            marginBottom: -2,
+            cursor: "pointer",
+            transition: "all 0.15s",
+          }}
+        >
+          {t.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function MetricCard({ label, value, sub, color }) {
+  return (
+    <div style={{
+      background: color ? `${color}11` : COLORS.surfaceAlt,
+      border: `1px solid ${color ? `${color}33` : COLORS.border}`,
+      borderRadius: 8,
+      padding: "16px 20px",
+      flex: 1,
+      minWidth: 140,
+    }}>
+      <div style={{ fontSize: 11, fontWeight: 600, color: COLORS.textMuted, textTransform: "uppercase", letterSpacing: "0.04em", fontFamily: sansFont, marginBottom: 4 }}>{label}</div>
+      <div style={{ fontSize: 28, fontWeight: 700, color: color || COLORS.text, fontFamily: font, lineHeight: 1.1 }}>{value}</div>
+      {sub && <div style={{ fontSize: 12, color: COLORS.textMuted, fontFamily: sansFont, marginTop: 4 }}>{sub}</div>}
+    </div>
+  );
+}
+
+function BarChart({ data, valueKey, labelKey, maxVal, color = COLORS.chart1, height = 160 }) {
+  const max = maxVal || Math.max(...data.map(d => d[valueKey]), 1);
+  return (
+    <div style={{ display: "flex", alignItems: "flex-end", gap: 4, height, padding: "0 4px" }}>
+      {data.map((d, i) => (
+        <div key={i} style={{ display: "flex", flexDirection: "column", alignItems: "center", flex: 1, height: "100%" }}>
+          <div style={{ flex: 1, display: "flex", alignItems: "flex-end", width: "100%" }}>
+            <div style={{
+              width: "100%",
+              height: `${Math.max((d[valueKey] / max) * 100, 2)}%`,
+              background: color,
+              borderRadius: "4px 4px 0 0",
+              opacity: 0.85,
+              transition: "height 0.3s ease",
+              minHeight: 2,
+            }} title={`${d[labelKey]}: ${typeof d[valueKey] === 'number' ? d[valueKey].toFixed(1) : d[valueKey]}`} />
+          </div>
+          <div style={{ fontSize: 10, color: COLORS.textMuted, fontFamily: sansFont, marginTop: 4, textAlign: "center" }}>{d[labelKey]}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function HorizBar({ label, value, max, color, unit = "min" }) {
+  const pct = max > 0 ? (value / max) * 100 : 0;
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+        <span style={{ fontSize: 13, fontFamily: sansFont, color: COLORS.text, fontWeight: 500 }}>{label}</span>
+        <span style={{ fontSize: 13, fontFamily: sansFont, color: COLORS.textMuted }}>{value.toFixed(1)} {unit}</span>
+      </div>
+      <div style={{ height: 8, background: COLORS.surfaceAlt, borderRadius: 4, overflow: "hidden" }}>
+        <div style={{ height: "100%", width: `${Math.min(pct, 100)}%`, background: color, borderRadius: 4, transition: "width 0.4s ease" }} />
+      </div>
+    </div>
+  );
+}
+
+// ─── Setup Panel ───
+function SetupPanel({ config, setConfig }) {
+  const updateStation = (idx, field, val) => {
+    const next = [...config.stations];
+    next[idx] = { ...next[idx], [field]: val };
+    setConfig({ ...config, stations: next });
+  };
+  const addStation = () => setConfig({ ...config, stations: [...config.stations, { name: "New Station", capacity: 1 }] });
+  const removeStation = (idx) => setConfig({ ...config, stations: config.stations.filter((_, i) => i !== idx) });
+
+  const updateStaff = (idx, field, val) => {
+    const next = [...config.staff];
+    next[idx] = { ...next[idx], [field]: val };
+    setConfig({ ...config, staff: next });
+  };
+  const addStaff = () => setConfig({ ...config, staff: [...config.staff, { role: "New Role", count: 1, shiftStart: "8:00", shiftEnd: "17:00", lunches: [{ start: "12:00", duration: 30 }] }] });
+  const removeStaff = (idx) => setConfig({ ...config, staff: config.staff.filter((_, i) => i !== idx) });
+
+  const updateApptType = (tIdx, field, val) => {
+    const next = [...config.appointmentTypes];
+    next[tIdx] = { ...next[tIdx], [field]: val };
+    setConfig({ ...config, appointmentTypes: next });
+  };
+  const updateFlowStep = (tIdx, sIdx, field, val) => {
+    const next = [...config.appointmentTypes];
+    const flow = [...next[tIdx].flow];
+    flow[sIdx] = { ...flow[sIdx], [field]: val };
+    next[tIdx] = { ...next[tIdx], flow };
+    setConfig({ ...config, appointmentTypes: next });
+  };
+  const addFlowStep = (tIdx) => {
+    const next = [...config.appointmentTypes];
+    next[tIdx] = { ...next[tIdx], flow: [...next[tIdx].flow, { station: config.stations[0]?.name || "", staffRole: config.staff[0]?.role || "", duration: 10 }] };
+    setConfig({ ...config, appointmentTypes: next });
+  };
+  const removeFlowStep = (tIdx, sIdx) => {
+    const next = [...config.appointmentTypes];
+    next[tIdx] = { ...next[tIdx], flow: next[tIdx].flow.filter((_, i) => i !== sIdx) };
+    setConfig({ ...config, appointmentTypes: next });
+  };
+  const addApptType = () => {
+    setConfig({ ...config, appointmentTypes: [...config.appointmentTypes, { name: "New Type", flow: [{ station: config.stations[0]?.name || "", staffRole: config.staff[0]?.role || "", duration: 15 }] }] });
+  };
+  const removeApptType = (idx) => setConfig({ ...config, appointmentTypes: config.appointmentTypes.filter((_, i) => i !== idx) });
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      {/* Operating Hours & Mode */}
+      <Card>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16 }}>
+          <span style={{ fontSize: 18, fontFamily: font, fontWeight: 700, color: COLORS.text }}>Clinic Settings</span>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 16 }}>
+          <div>
+            <Label>Open Time</Label>
+            <Input value={config.operatingHours.start} onChange={v => setConfig({ ...config, operatingHours: { ...config.operatingHours, start: v } })} />
+          </div>
+          <div>
+            <Label>Close Time</Label>
+            <Input value={config.operatingHours.end} onChange={v => setConfig({ ...config, operatingHours: { ...config.operatingHours, end: v } })} />
+          </div>
+          <div>
+            <Label>Schedule Mode</Label>
+            <div style={{ display: "flex", gap: 0, border: `1px solid ${COLORS.border}`, borderRadius: 6, overflow: "hidden" }}>
+              {["random", "template"].map(mode => (
+                <button
+                  key={mode}
+                  onClick={() => setConfig({ ...config, scheduleMode: mode })}
+                  style={{
+                    flex: 1,
+                    padding: "8px 12px",
+                    fontSize: 13,
+                    fontWeight: 600,
+                    fontFamily: sansFont,
+                    background: (config.scheduleMode || "random") === mode ? COLORS.accent : COLORS.surface,
+                    color: (config.scheduleMode || "random") === mode ? "#fff" : COLORS.textMuted,
+                    border: "none",
+                    cursor: "pointer",
+                    transition: "all 0.15s",
+                  }}
+                >
+                  {mode === "random" ? "Random" : "Template"}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+        {(config.scheduleMode || "random") === "random" && (
+          <div style={{ marginTop: 12, maxWidth: 200 }}>
+            <Label>Daily Patient Volume</Label>
+            <Input type="number" value={config.dailyVolume} onChange={v => setConfig({ ...config, dailyVolume: v })} />
+          </div>
+        )}
+        {(config.scheduleMode || "random") === "template" && (
+          <div style={{ marginTop: 8, fontSize: 13, color: COLORS.textMuted, fontFamily: sansFont }}>
+            Define your appointment schedule below in the Template Schedule section. Patient volume is determined by the template.
+          </div>
+        )}
+      </Card>
+
+      {/* Stations */}
+      <Card>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <span style={{ fontSize: 18, fontFamily: font, fontWeight: 700, color: COLORS.text }}>Stations / Rooms</span>
+          <Button variant="secondary" onClick={addStation}>+ Add Station</Button>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {config.stations.map((s, i) => (
+            <div key={i} style={{ display: "grid", gridTemplateColumns: "2fr 1fr auto", gap: 8, alignItems: "end" }}>
+              <div><Label>Name</Label><Input value={s.name} onChange={v => updateStation(i, "name", v)} /></div>
+              <div><Label>Capacity</Label><Input type="number" value={s.capacity} onChange={v => updateStation(i, "capacity", v)} /></div>
+              <Button variant="ghost" onClick={() => removeStation(i)} style={{ marginBottom: 2, color: COLORS.danger, fontSize: 18, padding: "8px" }}>×</Button>
+            </div>
+          ))}
+        </div>
+      </Card>
+
+      {/* Staff */}
+      <Card>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <span style={{ fontSize: 18, fontFamily: font, fontWeight: 700, color: COLORS.text }}>Staff Roles</span>
+          <Button variant="secondary" onClick={addStaff}>+ Add Role</Button>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {config.staff.map((s, i) => {
+            const lunches = s.lunches || [];
+            const syncLunches = (newCount) => {
+              const next = [...config.staff];
+              const existing = next[i].lunches || [];
+              const adjusted = [];
+              for (let k = 0; k < newCount; k++) {
+                adjusted.push(existing[k] || { start: "12:00", duration: 30 });
+              }
+              next[i] = { ...next[i], count: newCount, lunches: adjusted };
+              setConfig({ ...config, staff: next });
+            };
+            const updateLunch = (lIdx, field, val) => {
+              const next = [...config.staff];
+              const newLunches = [...(next[i].lunches || [])];
+              newLunches[lIdx] = { ...newLunches[lIdx], [field]: val };
+              next[i] = { ...next[i], lunches: newLunches };
+              setConfig({ ...config, staff: next });
+            };
+            return (
+              <div key={i} style={{ border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: 14, background: COLORS.surfaceAlt }}>
+                <div style={{ display: "grid", gridTemplateColumns: "2fr 0.7fr 1fr 1fr auto", gap: 8, alignItems: "end" }}>
+                  <div><Label>Role</Label><Input value={s.role} onChange={v => updateStaff(i, "role", v)} /></div>
+                  <div><Label>Count</Label><Input type="number" value={s.count} onChange={v => { updateStaff(i, "count", v); syncLunches(v); }} /></div>
+                  <div><Label>Shift Start</Label><Input value={s.shiftStart} onChange={v => updateStaff(i, "shiftStart", v)} /></div>
+                  <div><Label>Shift End</Label><Input value={s.shiftEnd} onChange={v => updateStaff(i, "shiftEnd", v)} /></div>
+                  <Button variant="ghost" onClick={() => removeStaff(i)} style={{ marginBottom: 2, color: COLORS.danger, fontSize: 18, padding: "8px" }}>×</Button>
+                </div>
+                {/* Lunch breaks per individual */}
+                {lunches.length > 0 && (
+                  <div style={{ marginTop: 10, paddingTop: 10, borderTop: `1px solid ${COLORS.border}` }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 6 }}>
+                      <div style={{ fontSize: 11, fontWeight: 600, color: COLORS.textMuted, fontFamily: sansFont, textTransform: "uppercase", letterSpacing: "0.04em" }}>Staff Member</div>
+                      <div style={{ fontSize: 11, fontWeight: 600, color: COLORS.textMuted, fontFamily: sansFont, textTransform: "uppercase", letterSpacing: "0.04em" }}>Lunch Start</div>
+                      <div style={{ fontSize: 11, fontWeight: 600, color: COLORS.textMuted, fontFamily: sansFont, textTransform: "uppercase", letterSpacing: "0.04em" }}>Lunch Duration (min)</div>
+                    </div>
+                    {lunches.map((l, lIdx) => (
+                      <div key={lIdx} style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 4, alignItems: "center" }}>
+                        <div style={{ fontSize: 13, fontFamily: sansFont, color: COLORS.text, paddingLeft: 4 }}>
+                          {s.role} {lunches.length > 1 ? `#${lIdx + 1}` : ""}
+                        </div>
+                        <Input value={l.start} onChange={v => updateLunch(lIdx, "start", v)} />
+                        <Input type="number" value={l.duration} onChange={v => updateLunch(lIdx, "duration", v)} />
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+
+      {/* Appointment Types */}
+      <Card>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <span style={{ fontSize: 18, fontFamily: font, fontWeight: 700, color: COLORS.text }}>Appointment Types</span>
+          <Button variant="secondary" onClick={addApptType}>+ Add Type</Button>
+        </div>
+        {config.appointmentTypes.map((appt, tIdx) => (
+          <div key={tIdx} style={{ border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: 16, marginBottom: 12, background: COLORS.surfaceAlt }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+              <Input value={appt.name} onChange={v => updateApptType(tIdx, "name", v)} style={{ fontWeight: 700, fontSize: 15, background: "transparent", border: "none", padding: 0 }} />
+              <Button variant="ghost" onClick={() => removeApptType(tIdx)} style={{ color: COLORS.danger }}>Remove</Button>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "2fr 2fr 1fr auto", gap: 8, marginBottom: 8 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: COLORS.textMuted, fontFamily: sansFont, textTransform: "uppercase", letterSpacing: "0.04em" }}>Task</div>
+              <div style={{ fontSize: 11, fontWeight: 600, color: COLORS.textMuted, fontFamily: sansFont, textTransform: "uppercase", letterSpacing: "0.04em" }}>Role</div>
+              <div style={{ fontSize: 11, fontWeight: 600, color: COLORS.textMuted, fontFamily: sansFont, textTransform: "uppercase", letterSpacing: "0.04em" }}>Duration (min)</div>
+              <div style={{ width: 34 }} />
+            </div>
+            {appt.flow.map((step, sIdx) => (
+              <div key={sIdx} style={{ display: "grid", gridTemplateColumns: "2fr 2fr 1fr auto", gap: 8, alignItems: "end", marginBottom: 6 }}>
+                <div>
+                  <select value={step.station} onChange={e => updateFlowStep(tIdx, sIdx, "station", e.target.value)} style={{ width: "100%", padding: "8px 12px", border: `1px solid ${COLORS.border}`, borderRadius: 6, fontSize: 14, fontFamily: sansFont, background: COLORS.surface }}>
+                    {config.stations.map(s => <option key={s.name} value={s.name}>{s.name}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <select value={step.staffRole} onChange={e => updateFlowStep(tIdx, sIdx, "staffRole", e.target.value)} style={{ width: "100%", padding: "8px 12px", border: `1px solid ${COLORS.border}`, borderRadius: 6, fontSize: 14, fontFamily: sansFont, background: COLORS.surface }}>
+                    {config.staff.map(s => <option key={s.role} value={s.role}>{s.role}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <Input type="number" value={step.duration} onChange={v => updateFlowStep(tIdx, sIdx, "duration", v)} placeholder="min" />
+                </div>
+                <Button variant="ghost" onClick={() => removeFlowStep(tIdx, sIdx)} style={{ color: COLORS.danger, fontSize: 18, padding: "8px" }}>×</Button>
+              </div>
+            ))}
+            <Button variant="ghost" onClick={() => addFlowStep(tIdx)} style={{ color: COLORS.accent, fontSize: 13, marginTop: 4 }}>+ Add Step</Button>
+          </div>
+        ))}
+      </Card>
+
+      {/* Template Schedule - only shown in template mode */}
+      {(config.scheduleMode || "random") === "template" && (
+        <Card>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+            <div>
+              <span style={{ fontSize: 18, fontFamily: font, fontWeight: 700, color: COLORS.text }}>Template Schedule</span>
+              <div style={{ fontSize: 13, color: COLORS.textMuted, fontFamily: sansFont, marginTop: 2 }}>
+                {(config.templateSlots || []).length} appointments scheduled
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <Button variant="secondary" onClick={() => {
+                const slots = config.templateSlots || [];
+                const lastSlot = slots[slots.length - 1];
+                const newTime = lastSlot ? addMinutesStr(lastSlot.arrival, 30) : config.operatingHours.start;
+                const newSlot = {
+                  arrival: newTime,
+                  apptType: config.appointmentTypes[0]?.name || "",
+                  assignTo: "any",
+                  assignIdx: 0,
+                };
+                setConfig({ ...config, templateSlots: [...slots, newSlot] });
+              }}>+ Add Appointment</Button>
+              <Button variant="secondary" onClick={() => {
+                const slots = [];
+                // Find the constraining role: the step with the longest duration in each appointment type
+                const constrainingRoles = new Set();
+                config.appointmentTypes.forEach(a => {
+                  if (a.flow.length === 0) return;
+                  const longest = a.flow.reduce((max, step) => step.duration > max.duration ? step : max, a.flow[0]);
+                  constrainingRoles.add(longest.staffRole);
+                });
+                config.staff.forEach(staffRole => {
+                  if (!constrainingRoles.has(staffRole.role)) return;
+                  for (let p = 0; p < staffRole.count; p++) {
+                    const sStart = parseTime(staffRole.shiftStart);
+                    const sEnd = parseTime(staffRole.shiftEnd);
+                    const lunch = (staffRole.lunches || [])[p];
+                    const lunchStart = lunch ? parseTime(lunch.start) : null;
+                    const lunchEnd = lunch ? lunchStart + (lunch.duration || 30) : null;
+                    let t = sStart;
+                    const apptType = config.appointmentTypes[0];
+                    const provStep = apptType?.flow.find(f => f.staffRole === staffRole.role);
+                    const interval = provStep ? provStep.duration : 20;
+                    while (t + interval <= sEnd) {
+                      if (lunchStart !== null && t >= lunchStart && t < lunchEnd) { t = lunchEnd; continue; }
+                      if (lunchStart !== null && t < lunchStart && t + interval > lunchStart) { t = lunchEnd; continue; }
+                      slots.push({
+                        arrival: formatTimeFromMin(t),
+                        apptType: apptType?.name || "",
+                        assignTo: staffRole.role,
+                        assignIdx: p,
+                      });
+                      t += interval;
+                    }
+                  }
+                });
+                slots.sort((a, b) => parseTime(a.arrival) - parseTime(b.arrival));
+                setConfig({ ...config, templateSlots: slots });
+              }}>Auto-fill from Staff</Button>
+            </div>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "0.8fr 1.5fr 1.5fr 0.8fr auto", gap: 8, marginBottom: 6 }}>
+            <div style={{ fontSize: 11, fontWeight: 600, color: COLORS.textMuted, fontFamily: sansFont, textTransform: "uppercase", letterSpacing: "0.04em" }}>Time</div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: COLORS.textMuted, fontFamily: sansFont, textTransform: "uppercase", letterSpacing: "0.04em" }}>Appt Type</div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: COLORS.textMuted, fontFamily: sansFont, textTransform: "uppercase", letterSpacing: "0.04em" }}>Assigned To</div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: COLORS.textMuted, fontFamily: sansFont, textTransform: "uppercase", letterSpacing: "0.04em" }}>Staff #</div>
+            <div style={{ width: 34 }} />
+          </div>
+
+          <div style={{ maxHeight: 500, overflowY: "auto" }}>
+            {(config.templateSlots || []).map((slot, idx) => (
+              <div key={idx} style={{ display: "grid", gridTemplateColumns: "0.8fr 1.5fr 1.5fr 0.8fr auto", gap: 8, alignItems: "center", marginBottom: 4 }}>
+                <Input value={slot.arrival} onChange={v => { const next = [...(config.templateSlots || [])]; next[idx] = { ...next[idx], arrival: v }; setConfig({ ...config, templateSlots: next }); }} placeholder="8:00" />
+                <select value={slot.apptType} onChange={e => { const next = [...(config.templateSlots || [])]; next[idx] = { ...next[idx], apptType: e.target.value }; setConfig({ ...config, templateSlots: next }); }} style={{ width: "100%", padding: "8px 12px", border: `1px solid ${COLORS.border}`, borderRadius: 6, fontSize: 14, fontFamily: sansFont, background: COLORS.surface }}>
+                  {config.appointmentTypes.map(a => <option key={a.name} value={a.name}>{a.name}</option>)}
+                </select>
+                <select value={slot.assignTo} onChange={e => { const next = [...(config.templateSlots || [])]; next[idx] = { ...next[idx], assignTo: e.target.value, assignIdx: 0 }; setConfig({ ...config, templateSlots: next }); }} style={{ width: "100%", padding: "8px 12px", border: `1px solid ${COLORS.border}`, borderRadius: 6, fontSize: 14, fontFamily: sansFont, background: COLORS.surface }}>
+                  <option value="any">Any available</option>
+                  {config.staff.map(s => <option key={s.role} value={s.role}>{s.role}</option>)}
+                </select>
+                {slot.assignTo !== "any" ? (
+                  <select value={slot.assignIdx || 0} onChange={e => { const next = [...(config.templateSlots || [])]; next[idx] = { ...next[idx], assignIdx: Number(e.target.value) }; setConfig({ ...config, templateSlots: next }); }} style={{ width: "100%", padding: "8px 12px", border: `1px solid ${COLORS.border}`, borderRadius: 6, fontSize: 14, fontFamily: sansFont, background: COLORS.surface }}>
+                    {Array.from({ length: config.staff.find(s => s.role === slot.assignTo)?.count || 1 }, (_, k) => (
+                      <option key={k} value={k}>#{k + 1}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <div style={{ padding: "8px 12px", fontSize: 13, color: COLORS.textLight, fontFamily: sansFont }}>—</div>
+                )}
+                <Button variant="ghost" onClick={() => { setConfig({ ...config, templateSlots: (config.templateSlots || []).filter((_, j) => j !== idx) }); }} style={{ color: COLORS.danger, fontSize: 18, padding: "8px" }}>×</Button>
+              </div>
+            ))}
+          </div>
+          {(config.templateSlots || []).length === 0 && (
+            <div style={{ textAlign: "center", padding: 30, color: COLORS.textMuted, fontFamily: sansFont, fontSize: 14 }}>
+              No appointments yet. Use "+ Add Appointment" to build one at a time, or "Auto-fill from Staff" to generate a full day.
+            </div>
+          )}
+        </Card>
+      )}
+    </div>
+  );
+}
+
+// ─── Swim Lane Flow Map ───
+function SwimLaneMap({ result, config }) {
+  const { patients } = result;
+  const [hoveredPatient, setHoveredPatient] = useState(null);
+  const [viewRange, setViewRange] = useState(null); // null = full day
+
+  if (!patients || patients.length === 0) return null;
+
+  // Get all unique stations in flow order from the first patient
+  const stationOrder = [];
+  const seen = new Set();
+  patients.forEach(p => {
+    p.log.forEach(step => {
+      if (!seen.has(step.station)) {
+        seen.add(step.station);
+        stationOrder.push(step.station);
+      }
+    });
+  });
+
+  // Time range
+  const allTimes = patients.flatMap(p => p.log.flatMap(s => [s.arrival, s.serviceEnd]));
+  const globalMin = Math.min(...allTimes);
+  const globalMax = Math.max(...allTimes);
+  const rangeStart = viewRange ? viewRange[0] : globalMin;
+  const rangeEnd = viewRange ? viewRange[1] : globalMax;
+  const rangeSpan = Math.max(rangeEnd - rangeStart, 1);
+
+  // Layout constants
+  const labelWidth = 100;
+  const laneHeight = 56;
+  const headerHeight = 32;
+  const patientBarHeight = 10;
+
+  // Color palette for patients
+  const patientColors = [
+    COLORS.chart1, COLORS.chart2, COLORS.chart3, COLORS.chart4, COLORS.chart5,
+    "#3B82B6", "#E67E22", "#27AE60", "#8E44AD", "#C0392B",
+    "#16A085", "#D4AC0D", "#2C3E50", "#E74C3C", "#1ABC9C",
+  ];
+
+  // Assign colors by patient
+  const getColor = (pid) => patientColors[(pid - 1) % patientColors.length];
+
+  // Build time axis labels
+  const timeLabels = [];
+  const startHour = Math.floor(rangeStart / 60);
+  const endHour = Math.ceil(rangeEnd / 60);
+  for (let h = startHour; h <= endHour; h++) {
+    const t = h * 60;
+    if (t >= rangeStart && t <= rangeEnd) {
+      timeLabels.push({ label: `${h % 12 || 12}${h < 12 ? 'a' : 'p'}`, pos: ((t - rangeStart) / rangeSpan) * 100 });
+    }
+  }
+
+  // Zoom presets
+  const zoomRanges = [
+    { label: "Full Day", range: null },
+    { label: "Morning", range: [globalMin, globalMin + (globalMax - globalMin) * 0.35] },
+    { label: "Midday", range: [globalMin + (globalMax - globalMin) * 0.3, globalMin + (globalMax - globalMin) * 0.7] },
+    { label: "Afternoon", range: [globalMin + (globalMax - globalMin) * 0.6, globalMax] },
+  ];
+
+  // For each lane (station), stack patients into sub-rows to avoid overlap
+  const laneData = stationOrder.map(station => {
+    const blocks = [];
+    patients.forEach(p => {
+      p.log.forEach(step => {
+        if (step.station === station) {
+          blocks.push({
+            patientId: p.id,
+            type: p.type,
+            start: step.serviceStart,
+            end: step.serviceEnd,
+            waitStart: step.arrival,
+            wait: step.wait,
+            duration: step.duration,
+          });
+        }
+      });
+    });
+    blocks.sort((a, b) => a.start - b.start);
+
+    // Stack into sub-rows
+    const rows = [];
+    blocks.forEach(block => {
+      let placed = false;
+      for (const row of rows) {
+        const last = row[row.length - 1];
+        if (block.start >= last.end) {
+          row.push(block);
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) {
+        rows.push([block]);
+      }
+    });
+
+    return { station, rows, blockCount: blocks.length };
+  });
+
+  const maxRows = Math.max(...laneData.map(l => l.rows.length), 1);
+  const dynamicLaneHeight = (rows) => Math.max(laneHeight, rows * (patientBarHeight + 3) + 16);
+
+  const totalHeight = headerHeight + laneData.reduce((s, l) => s + dynamicLaneHeight(l.rows.length), 0);
+
+  return (
+    <Card style={{ overflow: "hidden" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+        <div>
+          <div style={{ fontSize: 18, fontFamily: font, fontWeight: 700, color: COLORS.text }}>Patient Flow Map</div>
+          <div style={{ fontSize: 13, color: COLORS.textMuted, fontFamily: sansFont, marginTop: 2 }}>
+            Each bar represents a patient at a station. Gaps between bars show wait time.
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 4 }}>
+          {zoomRanges.map(z => (
+            <button
+              key={z.label}
+              onClick={() => setViewRange(z.range)}
+              style={{
+                padding: "4px 10px",
+                fontSize: 11,
+                fontWeight: 600,
+                fontFamily: sansFont,
+                background: (viewRange === z.range || (viewRange === null && z.range === null)) ? COLORS.accent : COLORS.surfaceAlt,
+                color: (viewRange === z.range || (viewRange === null && z.range === null)) ? "#fff" : COLORS.textMuted,
+                border: `1px solid ${COLORS.border}`,
+                borderRadius: 4,
+                cursor: "pointer",
+              }}
+            >
+              {z.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Legend */}
+      <div style={{ display: "flex", gap: 16, marginBottom: 12, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontFamily: sansFont, color: COLORS.textMuted }}>
+          <div style={{ width: 24, height: 8, borderRadius: 2, background: COLORS.chart1, opacity: 0.85 }} />
+          Service time
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontFamily: sansFont, color: COLORS.textMuted }}>
+          <div style={{ width: 24, height: 8, borderRadius: 2, background: COLORS.chart1, opacity: 0.25 }} />
+          Wait time
+        </div>
+        {hoveredPatient && (
+          <div style={{ fontSize: 12, fontFamily: sansFont, color: COLORS.text, fontWeight: 600, marginLeft: "auto" }}>
+            Patient #{hoveredPatient.patientId} ({hoveredPatient.type}) — {hoveredPatient.station}: waited {hoveredPatient.wait.toFixed(0)}m, served {hoveredPatient.duration.toFixed(0)}m
+          </div>
+        )}
+      </div>
+
+      {/* Swim lanes */}
+      <div style={{ position: "relative", overflowX: "auto" }}>
+        <div style={{ display: "flex", minWidth: 700 }}>
+          {/* Station labels */}
+          <div style={{ width: labelWidth, flexShrink: 0 }}>
+            <div style={{ height: headerHeight }} />
+            {laneData.map((lane, i) => (
+              <div key={lane.station} style={{
+                height: dynamicLaneHeight(lane.rows.length),
+                display: "flex",
+                alignItems: "center",
+                borderTop: i === 0 ? `1px solid ${COLORS.border}` : "none",
+                borderBottom: `1px solid ${COLORS.border}`,
+                paddingRight: 8,
+              }}>
+                <div style={{ fontSize: 12, fontWeight: 600, fontFamily: sansFont, color: COLORS.text, lineHeight: 1.2 }}>
+                  {lane.station}
+                  <div style={{ fontSize: 10, fontWeight: 400, color: COLORS.textMuted }}>{lane.blockCount} visits</div>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* Timeline area */}
+          <div style={{ flex: 1, position: "relative" }}>
+            {/* Time axis header */}
+            <div style={{ height: headerHeight, position: "relative", borderBottom: `1px solid ${COLORS.border}` }}>
+              {timeLabels.map(t => (
+                <div key={t.label} style={{
+                  position: "absolute",
+                  left: `${t.pos}%`,
+                  transform: "translateX(-50%)",
+                  fontSize: 11,
+                  fontFamily: sansFont,
+                  color: COLORS.textMuted,
+                  fontWeight: 500,
+                  top: 8,
+                }}>
+                  {t.label}
+                </div>
+              ))}
+            </div>
+
+            {/* Lanes */}
+            {laneData.map((lane, laneIdx) => {
+              const h = dynamicLaneHeight(lane.rows.length);
+              return (
+                <div key={lane.station} style={{
+                  height: h,
+                  position: "relative",
+                  borderBottom: `1px solid ${COLORS.border}`,
+                  background: laneIdx % 2 === 0 ? "transparent" : `${COLORS.surfaceAlt}55`,
+                }}>
+                  {/* Gridlines */}
+                  {timeLabels.map(t => (
+                    <div key={t.label} style={{
+                      position: "absolute",
+                      left: `${t.pos}%`,
+                      top: 0,
+                      bottom: 0,
+                      width: 1,
+                      background: `${COLORS.border}88`,
+                    }} />
+                  ))}
+
+                  {/* Patient blocks */}
+                  {lane.rows.map((row, rowIdx) => (
+                    row.map(block => {
+                      const leftPct = ((block.waitStart - rangeStart) / rangeSpan) * 100;
+                      const waitWidthPct = ((block.start - block.waitStart) / rangeSpan) * 100;
+                      const svcWidthPct = ((block.end - block.start) / rangeSpan) * 100;
+                      const topPx = 8 + rowIdx * (patientBarHeight + 3);
+                      const color = getColor(block.patientId);
+                      const isHovered = hoveredPatient?.patientId === block.patientId;
+
+                      if (leftPct > 100 || leftPct + waitWidthPct + svcWidthPct < 0) return null;
+
+                      return (
+                        <div key={`${block.patientId}-${block.start}`}>
+                          {/* Wait bar */}
+                          {block.wait > 0 && (
+                            <div
+                              style={{
+                                position: "absolute",
+                                left: `${leftPct}%`,
+                                width: `${Math.max(waitWidthPct, 0.15)}%`,
+                                top: topPx,
+                                height: patientBarHeight,
+                                background: color,
+                                opacity: isHovered ? 0.4 : 0.15,
+                                borderRadius: "2px 0 0 2px",
+                                transition: "opacity 0.15s",
+                              }}
+                              onMouseEnter={() => setHoveredPatient({ ...block, station: lane.station })}
+                              onMouseLeave={() => setHoveredPatient(null)}
+                            />
+                          )}
+                          {/* Service bar */}
+                          <div
+                            style={{
+                              position: "absolute",
+                              left: `${leftPct + waitWidthPct}%`,
+                              width: `${Math.max(svcWidthPct, 0.2)}%`,
+                              top: topPx,
+                              height: patientBarHeight,
+                              background: color,
+                              opacity: isHovered ? 1 : 0.75,
+                              borderRadius: block.wait > 0 ? "0 2px 2px 0" : 2,
+                              cursor: "pointer",
+                              transition: "opacity 0.15s",
+                              boxShadow: isHovered ? `0 0 0 2px ${color}` : "none",
+                            }}
+                            onMouseEnter={() => setHoveredPatient({ ...block, station: lane.station })}
+                            onMouseLeave={() => setHoveredPatient(null)}
+                          />
+                        </div>
+                      );
+                    })
+                  ))}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+// ─── Results Panel ───
+function ResultsPanel({ result, config }) {
+  if (!result) return null;
+  const { summary, bottlenecks, hourlyData } = result;
+  const maxWaitStation = bottlenecks[0];
+  const maxHourlyWait = Math.max(...hourlyData.map(h => h.avgWait), 1);
+  const maxHourlyArr = Math.max(...hourlyData.map(h => h.arrivals), 1);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      {/* Summary Metrics */}
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+        <MetricCard label="Avg Total Wait" value={`${summary.avgWait.toFixed(0)}m`} sub="per patient across all stations" color={summary.avgWait > 20 ? COLORS.warn : COLORS.good} />
+        <MetricCard label="Avg Door-to-Door" value={formatMin(summary.avgThroughput)} sub="arrival to departure" color={COLORS.chart3} />
+        <MetricCard label="Max Wait" value={`${summary.maxWait.toFixed(0)}m`} sub="worst-case patient" color={summary.maxWait > 45 ? COLORS.danger : COLORS.warn} />
+        <MetricCard label="Patients" value={summary.totalPatients} sub="simulated today" />
+      </div>
+
+      {/* Bottleneck Analysis */}
+      <Card>
+        <div style={{ fontSize: 18, fontFamily: font, fontWeight: 700, color: COLORS.text, marginBottom: 4 }}>Bottleneck Analysis</div>
+        <div style={{ fontSize: 13, color: COLORS.textMuted, fontFamily: sansFont, marginBottom: 16 }}>Stations ranked by average patient wait time</div>
+        {bottlenecks.map((b, i) => (
+          <HorizBar
+            key={b.name}
+            label={b.name}
+            value={b.avgWait}
+            max={Math.max(...bottlenecks.map(x => x.avgWait), 1)}
+            color={i === 0 && b.avgWait > 5 ? COLORS.danger : i < 2 ? COLORS.warn : COLORS.good}
+          />
+        ))}
+      </Card>
+
+      {/* Station Utilization */}
+      <Card>
+        <div style={{ fontSize: 18, fontFamily: font, fontWeight: 700, color: COLORS.text, marginBottom: 4 }}>Station Utilization</div>
+        <div style={{ fontSize: 13, color: COLORS.textMuted, fontFamily: sansFont, marginBottom: 16 }}>
+          Percentage of available capacity used (over 85% signals a constraint)
+        </div>
+        {bottlenecks.map(b => {
+          const pct = (b.utilization * 100);
+          const color = pct > 85 ? COLORS.danger : pct > 65 ? COLORS.warn : COLORS.good;
+          return <HorizBar key={b.name} label={b.name} value={pct} max={100} color={color} unit="%" />;
+        })}
+      </Card>
+
+      {/* Hourly Pattern */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+        <Card>
+          <div style={{ fontSize: 15, fontFamily: font, fontWeight: 700, color: COLORS.text, marginBottom: 12 }}>Arrivals by Hour</div>
+          <BarChart data={hourlyData} valueKey="arrivals" labelKey="hour" maxVal={maxHourlyArr} color={COLORS.chart1} />
+        </Card>
+        <Card>
+          <div style={{ fontSize: 15, fontFamily: font, fontWeight: 700, color: COLORS.text, marginBottom: 12 }}>Avg Wait by Hour</div>
+          <BarChart data={hourlyData} valueKey="avgWait" labelKey="hour" maxVal={maxHourlyWait} color={COLORS.chart2} />
+        </Card>
+      </div>
+
+      {/* Swim Lane Flow Map */}
+      <SwimLaneMap result={result} config={config} />
+
+      {/* Key Findings */}
+      <Card style={{ borderLeft: `4px solid ${COLORS.accent}` }}>
+        <div style={{ fontSize: 15, fontFamily: font, fontWeight: 700, color: COLORS.text, marginBottom: 8 }}>Key Findings</div>
+        <div style={{ fontSize: 14, fontFamily: sansFont, color: COLORS.text, lineHeight: 1.7 }}>
+          {maxWaitStation && maxWaitStation.avgWait > 5 && (
+            <p style={{ margin: "0 0 8px" }}>
+              <strong style={{ color: COLORS.danger }}>{maxWaitStation.name}</strong> is your primary bottleneck with an average wait of {maxWaitStation.avgWait.toFixed(1)} minutes per patient.
+              {maxWaitStation.utilization > 0.85
+                ? " This station is running above 85% utilization, meaning capacity is the constraint. Consider adding a room or extending hours."
+                : " Utilization is moderate, so the constraint may be staffing rather than physical capacity. Check staff availability during peak hours."}
+            </p>
+          )}
+          {hourlyData.length > 0 && (() => {
+            const peakHour = hourlyData.reduce((a, b) => b.avgWait > a.avgWait ? b : a);
+            return peakHour.avgWait > 10 ? (
+              <p style={{ margin: "0 0 8px" }}>Peak wait times occur around <strong>{peakHour.hour}</strong>. Staggering appointments or adding staff during this window could reduce delays.</p>
+            ) : null;
+          })()}
+          {summary.avgWait < 10 && (
+            <p style={{ margin: 0, color: COLORS.good }}>Overall flow looks healthy. Average wait under 10 minutes suggests good capacity-demand balance.</p>
+          )}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+// ─── Compare Panel ───
+function ComparePanel({ baseResult, compareResult, baseLabel, compareLabel }) {
+  if (!baseResult || !compareResult) return null;
+
+  const delta = (a, b) => {
+    const diff = b - a;
+    const pct = a > 0 ? ((diff / a) * 100).toFixed(0) : 0;
+    return { diff, pct, better: diff < 0 };
+  };
+
+  const waitDelta = delta(baseResult.summary.avgWait, compareResult.summary.avgWait);
+  const throughDelta = delta(baseResult.summary.avgThroughput, compareResult.summary.avgThroughput);
+  const maxDelta = delta(baseResult.summary.maxWait, compareResult.summary.maxWait);
+
+  const DeltaDisplay = ({ d, unit = "min", lowerIsBetter = true }) => {
+    const improved = lowerIsBetter ? d.better : !d.better;
+    return (
+      <span style={{ fontSize: 14, fontWeight: 700, color: improved ? COLORS.good : COLORS.danger, fontFamily: sansFont }}>
+        {d.diff > 0 ? "+" : ""}{d.diff.toFixed(1)}{unit} ({d.diff > 0 ? "+" : ""}{d.pct}%)
+      </span>
+    );
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <Card style={{ borderLeft: `4px solid ${COLORS.chart3}` }}>
+        <div style={{ fontSize: 18, fontFamily: font, fontWeight: 700, color: COLORS.text, marginBottom: 16 }}>Scenario Comparison</div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr auto 1fr", gap: 8, fontFamily: sansFont }}>
+          <div style={{ fontWeight: 600, color: COLORS.textMuted, fontSize: 12, textTransform: "uppercase", letterSpacing: "0.04em" }}>{baseLabel}</div>
+          <div />
+          <div style={{ fontWeight: 600, color: COLORS.textMuted, fontSize: 12, textTransform: "uppercase", letterSpacing: "0.04em" }}>{compareLabel}</div>
+
+          {[
+            { label: "Avg Wait", baseVal: `${baseResult.summary.avgWait.toFixed(1)}m`, compVal: `${compareResult.summary.avgWait.toFixed(1)}m`, d: waitDelta },
+            { label: "Door-to-Door", baseVal: formatMin(baseResult.summary.avgThroughput), compVal: formatMin(compareResult.summary.avgThroughput), d: throughDelta },
+            { label: "Max Wait", baseVal: `${baseResult.summary.maxWait.toFixed(0)}m`, compVal: `${compareResult.summary.maxWait.toFixed(0)}m`, d: maxDelta },
+          ].map(row => (
+            <>
+              <div key={row.label + "base"} style={{ padding: "10px 0", borderTop: `1px solid ${COLORS.border}` }}>
+                <div style={{ fontSize: 12, color: COLORS.textMuted }}>{row.label}</div>
+                <div style={{ fontSize: 20, fontWeight: 700, fontFamily: font }}>{row.baseVal}</div>
+              </div>
+              <div key={row.label + "delta"} style={{ display: "flex", alignItems: "center", justifyContent: "center", borderTop: `1px solid ${COLORS.border}` }}>
+                <DeltaDisplay d={row.d} />
+              </div>
+              <div key={row.label + "comp"} style={{ padding: "10px 0", borderTop: `1px solid ${COLORS.border}` }}>
+                <div style={{ fontSize: 12, color: COLORS.textMuted }}>{row.label}</div>
+                <div style={{ fontSize: 20, fontWeight: 700, fontFamily: font }}>{row.compVal}</div>
+              </div>
+            </>
+          ))}
+        </div>
+      </Card>
+
+      {/* Station-by-station comparison */}
+      <Card>
+        <div style={{ fontSize: 15, fontFamily: font, fontWeight: 700, color: COLORS.text, marginBottom: 12 }}>Wait Time by Station</div>
+        {baseResult.bottlenecks.map(b => {
+          const comp = compareResult.bottlenecks.find(c => c.name === b.name);
+          if (!comp) return null;
+          const d = delta(b.avgWait, comp.avgWait);
+          return (
+            <div key={b.name} style={{ display: "flex", alignItems: "center", gap: 12, padding: "8px 0", borderBottom: `1px solid ${COLORS.border}` }}>
+              <span style={{ flex: 1, fontSize: 14, fontFamily: sansFont, fontWeight: 500 }}>{b.name}</span>
+              <span style={{ width: 60, textAlign: "right", fontSize: 14, fontFamily: sansFont, color: COLORS.textMuted }}>{b.avgWait.toFixed(1)}m</span>
+              <span style={{ width: 24, textAlign: "center", color: COLORS.textLight }}>→</span>
+              <span style={{ width: 60, textAlign: "right", fontSize: 14, fontFamily: sansFont, fontWeight: 600 }}>{comp.avgWait.toFixed(1)}m</span>
+              <DeltaDisplay d={d} />
+            </div>
+          );
+        })}
+      </Card>
+    </div>
+  );
+}
+
+// ─── Main App ───
+export default function ClinicTempo() {
+  const [presetKey, setPresetKey] = useState("Primary Care");
+  const [config, setConfig] = useState(JSON.parse(JSON.stringify(PRESETS["Primary Care"])));
+  const [tab, setTab] = useState("setup");
+  const [result, setResult] = useState(null);
+  const [seed, setSeed] = useState(Math.floor(Math.random() * 100000));
+  const [savedScenarios, setSavedScenarios] = useState([]);
+  const [compareA, setCompareA] = useState(null);
+  const [compareB, setCompareB] = useState(null);
+  const [saveName, setSaveName] = useState("");
+
+  const handlePreset = (key) => {
+    setPresetKey(key);
+    setConfig(JSON.parse(JSON.stringify(PRESETS[key])));
+    setResult(null);
+  };
+
+  const handleRun = () => {
+    const r = runSimulation(config, seed);
+    setResult(r);
+    setTab("results");
+  };
+
+  const handleNewSeed = () => {
+    const newSeed = Math.floor(Math.random() * 100000);
+    setSeed(newSeed);
+    const r = runSimulation(config, newSeed);
+    setResult(r);
+  };
+
+  const handleSave = () => {
+    const name = saveName.trim() || `Scenario ${savedScenarios.length + 1}`;
+    setSavedScenarios([...savedScenarios, { name, config: JSON.parse(JSON.stringify(config)), result, seed }]);
+    setSaveName("");
+  };
+
+  const handleCompare = () => {
+    if (savedScenarios.length >= 2) {
+      setCompareA(savedScenarios[savedScenarios.length - 2]);
+      setCompareB(savedScenarios[savedScenarios.length - 1]);
+      setTab("compare");
+    }
+  };
+
+  return (
+    <div style={{ minHeight: "100vh", background: COLORS.bg, fontFamily: sansFont, color: COLORS.text }}>
+      <link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:wght@400;600;700&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+
+      {/* Header */}
+      <div style={{ background: COLORS.accent, padding: "24px 32px", color: "#fff" }}>
+        <div style={{ maxWidth: 1000, margin: "0 auto" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div>
+              <div style={{ fontSize: 28, fontWeight: 700, fontFamily: font, letterSpacing: "-0.02em" }}>Clinic Tempo</div>
+              <div style={{ fontSize: 14, opacity: 0.8, marginTop: 2 }}>Patient Flow Simulator</div>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              {Object.keys(PRESETS).map(k => (
+                <button
+                  key={k}
+                  onClick={() => handlePreset(k)}
+                  style={{
+                    padding: "6px 14px",
+                    borderRadius: 20,
+                    fontSize: 12,
+                    fontWeight: 600,
+                    fontFamily: sansFont,
+                    background: presetKey === k ? "rgba(255,255,255,0.25)" : "rgba(255,255,255,0.1)",
+                    color: "#fff",
+                    border: "1px solid rgba(255,255,255,0.2)",
+                    cursor: "pointer",
+                  }}
+                >
+                  {k}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Content */}
+      <div style={{ maxWidth: 1000, margin: "0 auto", padding: "0 32px 60px" }}>
+        <Tabs
+          tabs={[
+            { key: "setup", label: "Setup" },
+            { key: "results", label: "Results" },
+            { key: "compare", label: "Compare" },
+          ]}
+          active={tab}
+          onChange={setTab}
+        />
+
+        {tab === "setup" && (
+          <>
+            <SetupPanel config={config} setConfig={setConfig} />
+            <div style={{ display: "flex", gap: 12, marginTop: 24, justifyContent: "flex-end" }}>
+              <Button onClick={handleRun} style={{ padding: "12px 32px", fontSize: 15 }}>
+                Run Simulation
+              </Button>
+            </div>
+          </>
+        )}
+
+        {tab === "results" && (
+          <>
+            {result ? (
+              <>
+                <ResultsPanel result={result} config={config} />
+                <Card style={{ marginTop: 20, background: COLORS.surfaceAlt }}>
+                  <div style={{ display: "flex", gap: 12, alignItems: "end", flexWrap: "wrap" }}>
+                    <div style={{ flex: 1, minWidth: 200 }}>
+                      <Label>Scenario Name</Label>
+                      <Input value={saveName} onChange={v => setSaveName(v)} placeholder={`Scenario ${savedScenarios.length + 1}`} />
+                    </div>
+                    <Button variant="secondary" onClick={handleSave}>Save Scenario</Button>
+                    <Button variant="secondary" onClick={handleCompare} disabled={savedScenarios.length < 2}>
+                      Compare Last Two
+                    </Button>
+                    <Button variant="secondary" onClick={handleNewSeed}>New Random Day</Button>
+                    <Button onClick={() => { setTab("setup"); }}>Modify & Re-run</Button>
+                  </div>
+                  <div style={{ fontSize: 12, color: COLORS.textMuted, fontFamily: sansFont, marginTop: 8 }}>
+                    Tip: Save your baseline, go to Setup to change one variable, re-run, save again, then Compare. The same patient mix is used across runs so differences reflect your changes, not randomness. Use "New Random Day" to test with a different set of patients.
+                  </div>
+                </Card>
+              </>
+            ) : (
+              <Card style={{ textAlign: "center", padding: 60 }}>
+                <div style={{ fontSize: 48, marginBottom: 12 }}>📊</div>
+                <div style={{ fontSize: 18, fontFamily: font, fontWeight: 700, marginBottom: 8 }}>No simulation run yet</div>
+                <div style={{ fontSize: 14, color: COLORS.textMuted, marginBottom: 20 }}>Configure your clinic in Setup, then run the simulation to see results here.</div>
+                <Button onClick={() => setTab("setup")}>Go to Setup</Button>
+              </Card>
+            )}
+          </>
+        )}
+
+        {tab === "compare" && (
+          <>
+            {compareA && compareB ? (
+              <ComparePanel
+                baseResult={compareA.result}
+                compareResult={compareB.result}
+                baseLabel={compareA.name}
+                compareLabel={compareB.name}
+              />
+            ) : (
+              <Card style={{ textAlign: "center", padding: 60 }}>
+                <div style={{ fontSize: 48, marginBottom: 12 }}>⚖️</div>
+                <div style={{ fontSize: 18, fontFamily: font, fontWeight: 700, marginBottom: 8 }}>Save two scenarios to compare</div>
+                <div style={{ fontSize: 14, color: COLORS.textMuted, marginBottom: 20 }}>
+                  Run a simulation, save it, change something, run again, save again. Then you can compare the two side by side.
+                </div>
+                <Button onClick={() => setTab("setup")}>Go to Setup</Button>
+              </Card>
+            )}
+
+            {savedScenarios.length > 0 && (
+              <Card style={{ marginTop: 20 }}>
+                <div style={{ fontSize: 15, fontFamily: font, fontWeight: 700, color: COLORS.text, marginBottom: 12 }}>Saved Scenarios</div>
+                {savedScenarios.map((s, i) => (
+                  <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0", borderBottom: `1px solid ${COLORS.border}` }}>
+                    <div>
+                      <div style={{ fontSize: 14, fontFamily: sansFont, fontWeight: 600 }}>{s.name}</div>
+                      <div style={{ fontSize: 12, fontFamily: sansFont, color: COLORS.textMuted }}>
+                        Avg wait: {s.result.summary.avgWait.toFixed(1)}m · Door-to-door: {formatMin(s.result.summary.avgThroughput)}
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <Button variant="ghost" onClick={() => { setConfig(JSON.parse(JSON.stringify(s.config))); setSeed(s.seed); setResult(s.result); setTab("results"); }} style={{ fontSize: 12 }}>Load</Button>
+                      {savedScenarios.length >= 2 && (
+                        <select
+                          onChange={e => {
+                            const j = Number(e.target.value);
+                            if (!isNaN(j)) {
+                              setCompareA(s);
+                              setCompareB(savedScenarios[j]);
+                            }
+                          }}
+                          defaultValue=""
+                          style={{ fontSize: 12, fontFamily: sansFont, padding: "4px 8px", borderRadius: 4, border: `1px solid ${COLORS.border}`, color: COLORS.textMuted, cursor: "pointer" }}
+                        >
+                          <option value="" disabled>Compare vs...</option>
+                          {savedScenarios.map((other, j) => j !== i ? <option key={j} value={j}>{other.name}</option> : null)}
+                        </select>
+                      )}
+                      <Button variant="ghost" onClick={() => {
+                        setSavedScenarios(savedScenarios.filter((_, j) => j !== i));
+                        if (compareA?.name === s.name || compareB?.name === s.name) { setCompareA(null); setCompareB(null); }
+                      }} style={{ fontSize: 12, color: COLORS.danger }}>Delete</Button>
+                    </div>
+                  </div>
+                ))}
+              </Card>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
