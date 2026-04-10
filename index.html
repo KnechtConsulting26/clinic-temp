@@ -386,7 +386,7 @@
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 24px;
-    max-width: 800px;
+    max-width: 1000px;
   }
   .pricing-card {
     background: var(--surface);
@@ -400,7 +400,7 @@
     position: relative;
   }
   .pricing-card.featured::after {
-    content: 'MOST POPULAR';
+    content: 'BEST VALUE';
     position: absolute;
     top: -12px;
     left: 50%;
@@ -556,7 +556,7 @@
     .features-grid { grid-template-columns: 1fr; }
     .steps { grid-template-columns: 1fr 1fr; }
     .use-cases { grid-template-columns: 1fr; }
-    .pricing-grid { grid-template-columns: 1fr; }
+    .pricing-grid { grid-template-columns: 1fr !important; }
     .waitlist-section { padding: 40px 24px; }
     .waitlist-form { flex-direction: column; }
     section { padding: 60px 20px; }
@@ -729,7 +729,7 @@
     <div class="section-label">Pricing</div>
     <div class="section-title">Simple pricing. No enterprise sales calls.</div>
     <div class="section-sub">Start free, upgrade when you need the tools that actually drive decisions.</div>
-    <div class="pricing-grid">
+    <div class="pricing-grid" style="grid-template-columns: 1fr 1fr 1fr;">
       <div class="pricing-card">
         <div class="pricing-tier">Free</div>
         <div class="pricing-price">$0</div>
@@ -739,22 +739,35 @@
           <li>3 clinic presets</li>
           <li>Bottleneck analysis</li>
           <li>Hourly wait time charts</li>
-          <li>Basic results dashboard</li>
+          <li>Swim lane flow map</li>
         </ul>
         <a href="/app.html" class="btn-secondary">Try Free</a>
       </div>
-      <div class="pricing-card featured">
-        <div class="pricing-tier">Pro</div>
+      <div class="pricing-card">
+        <div class="pricing-tier">Pro Monthly</div>
         <div class="pricing-price">$39<span>/month</span></div>
-        <div class="pricing-desc">The full toolkit for schedule optimization.</div>
+        <div class="pricing-desc">Full toolkit, pay as you go.</div>
         <ul class="pricing-features">
           <li>Everything in Free</li>
           <li>Template scheduling with provider assignment</li>
           <li>Lunch break modeling per staff member</li>
           <li>Scenario save and compare</li>
-          <li>Swim lane flow map</li>
           <li>PDF and PowerPoint export</li>
           <li>Unlimited scenarios</li>
+        </ul>
+        <a href="#waitlist" class="btn-primary">Join the Waitlist</a>
+      </div>
+      <div class="pricing-card featured">
+        <div class="pricing-tier">Pro Annual</div>
+        <div class="pricing-price">$349<span>/year</span></div>
+        <div class="pricing-desc">Best value. Save 25% vs. monthly.</div>
+        <div style="background: #E8F8EF; color: #2A8C5A; font-size: 13px; font-weight: 700; padding: 8px 14px; border-radius: 6px; text-align: center; margin-bottom: 16px;">
+          Save $119/year ($29/month equivalent)
+        </div>
+        <ul class="pricing-features">
+          <li>Everything in Pro</li>
+          <li>Priority feature requests</li>
+          <li>Lock in your rate for 12 months</li>
         </ul>
         <a href="#waitlist" class="btn-primary">Join the Waitlist</a>
       </div>
@@ -766,7 +779,7 @@
 <section id="waitlist">
   <div class="waitlist-section">
     <h2>Get early access to Clinic Tempo Pro.</h2>
-    <p>Join the waitlist and be the first to know when we launch. Early subscribers get 30% off the first 3 months.</p>
+    <p>Join the waitlist and be the first to know when we launch. Early subscribers get 30% off for the first 3 months (monthly) or first year (annual).</p>
     <div class="waitlist-form" id="waitlist-form">
       <input type="email" id="waitlist-email" placeholder="you@yourclinic.com" required>
       <button onclick="submitWaitlist()">Join Waitlist</button>
@@ -778,10 +791,13 @@
 <!-- Footer -->
 <footer>
   <p>&copy; 2026 Clinic Tempo. Built for clinic managers who want better answers.</p>
-  <a href="/cdn-cgi/l/email-protection#cca4a9a0a0a38cafa0a5a2a5afb8a9a1bca3e2afa3a1"><span class="__cf_email__" data-cfemail="d3bbb6bfbfbc93b0bfbabdbab0a7b6bea3bcfdb0bcbe">[email&#160;protected]</span></a>
+  <a id="footer-email" href="#"></a>
 </footer>
 
-<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script>
+<script>
+(function(){var a='hello';var b='clinictempo.com';var el=document.getElementById('footer-email');el.href='mail'+'to:'+a+'@'+b;el.textContent=a+'@'+b;})();
+</script>
+<script>
 function submitWaitlist() {
   const email = document.getElementById('waitlist-email').value;
   if (!email || !email.includes('@')) {
